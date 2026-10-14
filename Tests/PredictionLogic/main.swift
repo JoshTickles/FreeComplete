@@ -270,6 +270,15 @@ precondition(PredictionPrompt.alternative("\"") == nil &&
              PredictionPrompt.alternative("(") == nil &&
              PredictionPrompt.alternative(" 2026") == " 2026",
              "Next-word choices exclude punctuation-only paths without excluding numbers")
+precondition(PredictionPrompt.alternative("[today]") == nil && PredictionPrompt.alternative(" [4]") == nil
+             && PredictionPrompt.alternative(" \"brief\"") == nil,
+             "Next-word choices exclude bracketed or quoted placeholders")
+precondition(PredictionPrompt.alternativeIdentity("n't") == PredictionPrompt.alternativeIdentity("n\u{2019}t"),
+             "Typographic and ASCII apostrophes are one alternative")
+check(PredictionPrompt.sameSlotAlternatives([" to", "n't", " the", " a", " for"]).joined(separator: "|"),
+      " to| the| a", "Alternatives after a complete word all start a new word")
+check(PredictionPrompt.sameSlotAlternatives(["tation.", " soon", "ter.", "ce"]).joined(separator: "|"),
+      "tation.|ter.|ce", "Alternatives inside a word all finish that word")
 
 
 let options = PredictionOptions(globalInstructions: "GLOBAL_SOURCE", appInstructions: "APP_SOURCE",

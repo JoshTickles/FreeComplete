@@ -162,7 +162,7 @@ private enum InferenceError: LocalizedError {
                                                       maxTokens: generationReserve, maxWords: wordLimit,
                                                       distinctWords: distinctWords, connection: connection)
             if case .alternatives = kind {
-                text = results.prefix(3).map(\.text).joined(separator: "\n")
+                text = PredictionPrompt.sameSlotAlternatives(results.map(\.text)).joined(separator: "\n")
             } else {
                 text = results.first?.text ?? ""
             }
@@ -296,9 +296,12 @@ private enum InferenceError: LocalizedError {
                 let total = sorted.reduce(Float32(0)) { $0 + $1.prob }
                 guard total.isFinite, total > 0 else { throw InferenceError.invalidResponse }
                 var firstAcceptedProbability: Float32?
+                // Alternatives exist to offer what the 0.05 gate would hide: the first word
+                // choice considers the whole retained top twenty, ranked by score.
+                let choosingAlternative = distinctWords && !prefixPending && sequence.bytes.isEmpty
                 for (index, token) in sorted.enumerated() {
                     let probability = token.prob / total
-                    guard CompletionProbabilityGate.accepts(probability, scannedIndex: index,
+                    guard choosingAlternative || CompletionProbabilityGate.accepts(probability, scannedIndex: index,
                         prefixPending: prefixPending, firstAcceptedProbability: firstAcceptedProbability) else { break }
                     var next = sequence
                     if prefixPending {
@@ -365,13 +368,16 @@ private enum InferenceError: LocalizedError {
                     : ($0.text.contains(where: { $0.isLetter || $0.isNumber }) ? $0.text : nil)
                 guard let identity else { return false }
                 return seen.insert(identity).inserted
-            }.prefix(9))
+            }.prefix(distinctWords ? 18 : 9))
             if frontier.isEmpty { break }
             // Every remaining prefix/completion increment is nonpositive. A
             // strictly better completed result cannot be overtaken by descendants.
             // Keep equal scores alive for deterministic tie-breaking.
+            // Alternatives settle on three choices for the best result's slot (new word or
+            // word ending); choices for the other slot are dropped and must not count.
+            let sameSlot = distinctWords ? PredictionPrompt.sameSlotAlternatives(finished.map(\.text)) : []
             let settledScore = distinctWords
-                ? (finished.count >= 3 ? finished[2].score : nil)
+                ? (sameSlot.count >= 3 ? finished.first(where: { $0.text == sameSlot[2] })?.score : nil)
                 : finished.first?.score
             if let settledScore, let bestActive = frontier.first,
                settledScore > bestActive.rank { break }

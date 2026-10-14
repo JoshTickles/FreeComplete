@@ -459,6 +459,12 @@ enum PredictionPrompt {
         let word = result.first == " " ? result.dropFirst() : result[...]
         guard word.contains(where: \.isLetterOrNumber), word.count < 35,
               !word.contains(where: \.isWhitespace) else { return nil }
+        // A next-word choice starts with a letter or digit. Finishing the current word may
+        // also start with an apostrophe or hyphen ("'t", "-date"). Brackets, quotes and
+        // markup ("[today]", "[4]", "<tex>") are placeholders or citations, not words.
+        guard let first = word.first,
+              first.isLetter || first.isNumber
+                || (result.first != " " && "'\u{2019}-".contains(first)) else { return nil }
         if WritingWordBoundary.checkpoint(String(word), maxWords: 2, terminal: true)?.limitReached == true {
             return nil
         }
@@ -470,7 +476,18 @@ enum PredictionPrompt {
         var identity = insertion.trimmingCharacters(in: .whitespacesAndNewlines)
         while let last = identity.last, ".,!?;:。！？、；：".contains(last) { identity.removeLast() }
         guard !identity.isEmpty else { return nil }
-        return identity.folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        // Typographic and ASCII apostrophes spell the same word ("n’t" and "n't").
+        return identity.replacingOccurrences(of: "\u{2019}", with: "'")
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// Alternatives fill one slot: either all start a new word or all finish the word
+    /// being typed, following the best-ranked choice. Mixing " to" with "n't" (from
+    /// re-spelling "is" as "isn't") offers choices for two different positions.
+    static func sameSlotAlternatives(_ ranked: [String], limit: Int = 3) -> [String] {
+        guard let best = ranked.first else { return [] }
+        let startsWord = best.first?.isWhitespace == true
+        return Array(ranked.filter { ($0.first?.isWhitespace == true) == startsWord }.prefix(limit))
     }
 
     static func nextWord(_ suggestion: String, trailingSpace: Bool, punctuation: Bool) -> String {

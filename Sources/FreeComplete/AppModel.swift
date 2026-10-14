@@ -38,7 +38,6 @@ private struct PendingRemainder {
     let text: String
     let expiresAt: Date
     let screen: ScreenUse?
-    var queuedFull: Bool?
 
     func matches(_ next: TextSnapshot) -> Bool {
         Date() < expiresAt && next.pid == source.pid && CFEqual(next.element, source.element)
@@ -55,6 +54,9 @@ private struct Prefetch {
     let expectedBefore: String
     var result: Continuation?
     var task: Task<Void, Never>?
+    /// Set when the whole visible suggestion is accepted: until then a further Tab
+    /// belongs to this result. Bounded so a result that never shows cannot hold Tab.
+    var armedUntil: Date?
 
     func matches(_ next: TextSnapshot) -> Bool {
         next.pid == source.pid && CFEqual(next.element, source.element)
@@ -110,6 +112,8 @@ final class AppModel: ObservableObject, TextObserver {
     private var suggestion = ""
     private var pendingRemainder: PendingRemainder?
     private var prefetch: Prefetch?
+    /// Tab/grave presses that arrived before the next part of the suggestion was on screen.
+    private var queuedAccepts: [Bool] = []
     private var pauseUntil: Date = .distantPast
     private var alternativeChoices: [String] = []
     @Published private var observedAppIDs = Set<String>()
@@ -382,6 +386,8 @@ final class AppModel: ObservableObject, TextObserver {
         pending?.cancel()
         pendingGeneration = nil
         pendingRemainder = nil
+        queuedAccepts.removeAll()
+        cancelPrefetch()
         clearSuggestion()
     }
 
@@ -411,9 +417,6 @@ final class AppModel: ObservableObject, TextObserver {
             pendingRemainder = nil
             if remainder.matches(newSnapshot), allows(newSnapshot) {
                 showContinuation(remainder.text, for: newSnapshot, prefetchNext: false, screen: remainder.screen)
-                if let full = remainder.queuedFull {
-                    Task { @MainActor [weak self] in _ = self?.acceptSuggestion(full: full) }
-                }
                 return
             }
         }
@@ -443,6 +446,7 @@ final class AppModel: ObservableObject, TextObserver {
             return
         }
         cancelPrefetch()
+        queuedAccepts.removeAll()
         guard eligible(newSnapshot) else { return }
         let marker = newSnapshot.fingerprint
         let generation = beginGeneration()
@@ -505,6 +509,11 @@ final class AppModel: ObservableObject, TextObserver {
         suggestionScreen = screen
         if let screen { lastScreenUse = screen }
         if prefetchNext { startPrefetch(after: shown, from: snapshot) }
+        // Tabs pressed before this suggestion appeared are applied now, in order.
+        if !queuedAccepts.isEmpty {
+            let full = queuedAccepts.removeFirst()
+            Task { @MainActor [weak self] in _ = self?.acceptSuggestion(full: full) }
+        }
     }
 
     private func startPrefetch(after shown: String, from snapshot: TextSnapshot) {
@@ -518,6 +527,7 @@ final class AppModel: ObservableObject, TextObserver {
             guard !Task.isCancelled, self.prefetch?.expectedBefore == expected else { return }
             self.prefetch?.result = result
             self.prefetch?.task = nil
+            if result.text.isEmpty { self.queuedAccepts.removeAll() }
             // Accepted before the prefetch finished: show it the moment it is ready.
             if let current = self.snapshot, self.prefetch?.matches(current) == true,
                self.suggestion.isEmpty, self.pendingRemainder == nil, self.eligible(current) {
@@ -537,13 +547,12 @@ final class AppModel: ObservableObject, TextObserver {
 
     func acceptSuggestion(full: Bool) -> Bool {
         if !alternativeChoices.isEmpty { return selectAlternative(0) }
-        if let remainder = pendingRemainder {
-            guard Date() < remainder.expiresAt, allows(remainder.source),
-                  NSWorkspace.shared.frontmostApplication?.processIdentifier == remainder.source.pid else {
-                pendingRemainder = nil
-                return false
-            }
-            pendingRemainder?.queuedFull = full
+        // The next part is still on its way (the field has not reported the last insert,
+        // or the continuation is still generating). Keep the key instead of letting it
+        // type a literal tab; it is applied as soon as the text appears.
+        if pendingRemainder != nil || awaitingPrefetch() {
+            guard queuedAccepts.count < 8 else { return true }
+            queuedAccepts.append(full)
             return true
         }
         guard let snapshot, !suggestion.isEmpty, allows(snapshot) else { return false }
@@ -574,6 +583,8 @@ final class AppModel: ObservableObject, TextObserver {
                 expiresAt: Date().addingTimeInterval(2),
                 screen: usedScreen
             )
+        } else {
+            prefetch?.armedUntil = Date().addingTimeInterval(1.5)
         }
         return true
     }
@@ -598,8 +609,18 @@ final class AppModel: ObservableObject, TextObserver {
             return Date() < remainder.expiresAt && allows(remainder.source)
                 && NSWorkspace.shared.frontmostApplication?.processIdentifier == remainder.source.pid
         }
+        if awaitingPrefetch() { return true }
         guard let snapshot, !suggestion.isEmpty || !alternativeChoices.isEmpty else { return false }
         return allows(snapshot) && NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.pid
+    }
+
+    /// True right after the whole suggestion was accepted while its continuation is
+    /// still pending or not yet shown. An empty continuation releases Tab again.
+    private func awaitingPrefetch() -> Bool {
+        guard suggestion.isEmpty, let prefetch, let until = prefetch.armedUntil, Date() < until,
+              allows(prefetch.source),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == prefetch.source.pid else { return false }
+        return prefetch.result.map { !$0.text.isEmpty } ?? true
     }
 
     func requestAlternatives() -> Bool {
