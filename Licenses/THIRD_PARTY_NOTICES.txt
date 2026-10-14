@@ -1,0 +1,40 @@
+FreeComplete bundles the following independently licensed components:
+
+llama.cpp (including its statically linked GGML and upstream vendor components)
+Source: https://github.com/ggml-org/llama.cpp
+Pinned commit: f2cc7282ce0042641df55e0e563b75e824e2b647
+Copyright (c) 2023-2026 the ggml authors and other contributors.
+License: MIT. The complete upstream LICENSE and applicable vendored licenses and
+notices are included under Licenses/llama.cpp/ in the app bundle.
+FreeComplete applies an original local patch to the pinned server's probability
+recording: a split UTF-8 token retains its next-token distribution even before
+display text is complete. Opt-in model log probabilities preserve the unmasked
+likelihood separately from sampler-conditioned selection probabilities.
+The patch is included as Licenses/llama.cpp/FreeComplete-raw-token-probabilities.patch.
+FreeComplete also adds a byte-prefix constraint for each next-token distribution.
+It matches public vocabulary pieces across requests without changing typed bytes.
+Transient masks belong to sampler state, not serialized caller logit biases.
+The original patch is included as Licenses/llama.cpp/FreeComplete-token-prefix.patch.
+FreeComplete's original shared-prefix patch adds opt-in request admission
+and routes eligible batches to llama.cpp's existing shared-prefix task owner.
+It serializes root tasks in the unified KV pool while their child branches run
+together, and prepares each transient byte-prefix mask once per HTTP request.
+Response readers check disconnection at 100-millisecond intervals with monotonic
+deadlines, so unrelated result notifications cannot extend a cancellation wait.
+Upstream owns shared prefill, prompt/KV sharing, result indexing and cancellation;
+the patch does not introduce a separate inference engine or change model attention.
+The original patch is included as Licenses/llama.cpp/FreeComplete-shared-prefix.patch.
+Apply patches in this order: token-prefix, raw-token-probabilities, shared-prefix.
+
+Gemma 4 E2B public base model, importance-matrix Q4_K_M GGUF
+Base model: https://huggingface.co/google/gemma-4-E2B
+Quantized by: mradermacher
+Source: https://huggingface.co/mradermacher/gemma-4-E2B-i1-GGUF
+File: gemma-4-E2B.i1-Q4_K_M.gguf
+Revision: a9bf638e53783fc93778f357cc5c672eab5393b1
+GGUF SHA-256: 3cc0e9c2b4bbffea7f3f6cfe1ffd1591f4dafe02c43f78952f1142a24172df65
+Copyright Google LLC. License: Apache License, Version 2.0.
+The complete license is included as Licenses/Gemma-4-E2B-Apache-2.0.txt in the app bundle.
+
+No Cotypist code, binaries, assets, installed weights, private history or profile
+data are used. The public base model is independently obtained and checksum-verified.

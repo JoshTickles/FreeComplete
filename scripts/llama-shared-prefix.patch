@@ -1,0 +1,392 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index cc929d2..afac2fd 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -37,7 +37,7 @@
+ #include <windows.h>
+ #endif
+ 
+-constexpr int HTTP_POLLING_SECONDS = 1;
++constexpr auto HTTP_POLLING_INTERVAL = std::chrono::milliseconds(100);
+ 
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (params.embedding ||
+@@ -925,6 +925,36 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+     return true;
+ }
+ 
++// One transient mask per HTTP request, shared by its parent and children.
++static std::shared_ptr<const std::vector<llama_logit_bias>> make_token_prefix_bias(
++        const llama_vocab * vocab, const std::vector<unsigned char> & prefix) {
++    if (prefix.empty()) {
++        return nullptr;
++    }
++    auto bias = std::make_shared<std::vector<llama_logit_bias>>();
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    bias->reserve(n_vocab);
++    std::vector<char> piece(128);
++    int matching = 0;
++    for (llama_token token = 0; token < n_vocab; ++token) {
++        int count = 0;
++        if (!llama_vocab_is_control(vocab, token)) {
++            count = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, false);
++            if (count < 0) {
++                piece.resize(-count);
++                count = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, false);
++            }
++        }
++        const bool match = count > 0 && std::equal(piece.begin(),
++            piece.begin() + std::min(static_cast<size_t>(count), prefix.size()), prefix.begin(),
++            [](char a, unsigned char b) { return static_cast<unsigned char>(a) == b; });
++        if (match) ++matching;
++        else bias->push_back({token, -INFINITY});
++    }
++    if (matching == 0) throw std::runtime_error("token_prefix has no vocabulary continuation");
++    return bias;
++}
++
+ //
+ // server_context_impl (private implementation)
+ //
+@@ -973,6 +1003,55 @@ public:
+         metrics.reset_bucket();
+     }
+ 
++    void validate_shared_completion(const task_params & request, server_task_type type,
++                                    task_response_type response, int id_slot,
++                                    const std::vector<server_tokens> & inputs) const {
++        if (type != SERVER_TASK_TYPE_COMPLETION || response != TASK_RESPONSE_TYPE_NONE ||
++            request.stream || request.n_cmpl != 1 || request.n_predict != 1 ||
++            !request.cache_prompt || request.sampling.backend_sampling ||
++            !request.post_sampling_probs || request.sampling.n_probs <= 0 ||
++            mctx || spec || id_slot != -1 || !params_base.kv_unified || !params_base.swa_full) {
++            throw std::runtime_error("share_prompt requires native non-streaming one-token CPU probability completion, prompt caching, no multimodal/speculative engine or fixed slot, and unified full-SWA KV");
++        }
++        if (inputs.size() < 2 || params_base.n_parallel < 2 ||
++            inputs.size() > size_t(params_base.n_parallel)) {
++            throw std::runtime_error("share_prompt requires 2..n_parallel inputs");
++        }
++        const llama_token n_vocab = llama_vocab_n_tokens(vocab);
++        const size_t slot_capacity = size_t(n_ctx_slot());
++        for (const auto & input : inputs) {
++            if (input.has_mtmd || input.size() < 2 || input.size() >= slot_capacity) {
++                throw std::runtime_error("share_prompt inputs require at least two tokens and room for one generated token");
++            }
++            for (const llama_token token : input.get_tokens()) {
++                if (token < 0 || token >= n_vocab) {
++                    throw std::runtime_error("share_prompt input contains an invalid token ID");
++                }
++            }
++        }
++        size_t n_shared = inputs.front().size() - 1;
++        for (size_t i = 1; i < inputs.size(); ++i) {
++            n_shared = std::min(n_shared, inputs.front().get_common_prefix(inputs[i]));
++            n_shared = std::min(n_shared, inputs[i].size() - 1);
++        }
++        if (n_shared == 0) {
++            throw std::runtime_error("share_prompt requires a common token prefix and at least one tail token per input");
++        }
++        // Subtract from the actual pool bound; no intermediate sum can overflow.
++        size_t remaining = llama_n_ctx(ctx_tgt);
++        if (n_shared > remaining) {
++            throw std::runtime_error("share_prompt exceeds the unified KV context capacity");
++        }
++        remaining -= n_shared;
++        for (const auto & input : inputs) {
++            const size_t tail = input.size() - n_shared;
++            if (tail >= remaining) {
++                throw std::runtime_error("share_prompt exceeds the unified KV context capacity");
++            }
++            remaining -= tail + 1;
++        }
++    }
++
+ private:
+     // note: accessing these fields outside of this class is not thread-safe
+     // use server_context methods instead
+@@ -1931,26 +2010,10 @@ private:
+                 } else {
+                     // A transient vocabulary mask is sampler state, not caller logit_bias.
+                     auto sampling = task.params.sampling;
+-                    const auto & prefix = task.params.token_prefix;
+-                    const int n_vocab = llama_vocab_n_tokens(vocab);
+-                    sampling.logit_bias.reserve(sampling.logit_bias.size() + n_vocab);
+-                    std::vector<char> piece(128);
+-                    int matching = 0;
+-                    for (llama_token token = 0; token < n_vocab; ++token) {
+-                        int count = 0;
+-                        if (!llama_vocab_is_control(vocab, token)) {
+-                            count = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, false);
+-                            if (count < 0) {
+-                                piece.resize(-count);
+-                                count = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, false);
+-                            }
+-                        }
+-                        const bool match = count > 0 && std::equal(piece.begin(),
+-                            piece.begin() + std::min(static_cast<size_t>(count), prefix.size()), prefix.begin(), [](char a, unsigned char b) { return static_cast<unsigned char>(a) == b; });
+-                        if (match) ++matching;
+-                        else sampling.logit_bias.push_back({token, -INFINITY});
+-                    }
+-                    if (matching == 0) throw std::runtime_error("token_prefix has no vocabulary continuation");
++                    const auto bias = task.params.token_prefix_bias
++                        ? task.params.token_prefix_bias
++                        : make_token_prefix_bias(vocab, task.params.token_prefix);
++                    sampling.logit_bias.insert(sampling.logit_bias.end(), bias->begin(), bias->end());
+                     slot.smpl.reset(common_sampler_init(model_tgt, sampling));
+                 }
+             } catch (std::exception & e) {
+@@ -2821,6 +2884,14 @@ private:
+ 
+                     const int id_task = task.id;
+ 
++                    // Each root task may use the entire unified pool. Its children
++                    // share that reservation; another root waits for their release.
++                    if (params_base.kv_unified && std::any_of(slots.begin(), slots.end(),
++                            [](const server_slot & active) { return active.is_processing(); })) {
++                        queue_tasks.defer(std::move(task));
++                        break;
++                    }
++
+                     server_slot * slot = get_available_slot(task);
+ 
+                     //
+@@ -4628,7 +4699,7 @@ private:
+     }
+ 
+     server_response_reader get_response_reader() {
+-        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
++        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_INTERVAL);
+     }
+ 
+     //
+@@ -4823,7 +4894,7 @@ server_context_meta server_context::get_meta() const {
+ struct server_res_generator : server_res_spipe {
+     server_response_reader rd;
+     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
+-            : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
++            : rd(queue_tasks, queue_results, HTTP_POLLING_INTERVAL) {
+         // fast path in case sleeping is disabled
+         bypass_sleep |= sleep_idle_seconds < 0;
+         if (!bypass_sleep) {
+@@ -4870,6 +4941,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         std::vector<server_task> tasks;
+ 
+         const auto & prompt = data.at("prompt");
++        task_params request_params = server_schema::eval_llama_cmpl_schema(
++                ctx_server.vocab, params, meta->logit_bias_eog, data);
++        const int id_slot = json_value(data, "id_slot", -1);
++        if (request_params.share_prompt) {
++            // Validate JSON token IDs before narrowing them to llama_token.
++            const int64_t n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
++            const auto validate_ids = [n_vocab](const auto & self, const json & value) -> void {
++                if (value.is_array()) {
++                    for (const auto & item : value) {
++                        self(self, item);
++                    }
++                } else if (value.is_number()) {
++                    if (!value.is_number_integer() ||
++                        value.get<double>() < 0 || value.get<double>() >= double(n_vocab)) {
++                        throw std::runtime_error("share_prompt input contains an invalid token ID");
++                    }
++                } else if (value.is_object() && value.contains("prompt_string")) {
++                    self(self, value.at("prompt_string"));
++                }
++            };
++            validate_ids(validate_ids, prompt);
++        }
+         // TODO: this log can become very long, put it behind a flag or think about a more compact format
+         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
+ 
+@@ -4894,6 +4987,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+         }
+ 
++        if (request_params.share_prompt) {
++            ctx_server.validate_shared_completion(request_params, type, res_type, id_slot, inputs);
++        }
++        request_params.token_prefix_bias = make_token_prefix_bias(ctx_server.vocab, request_params.token_prefix);
++
+         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+ 
+         for (size_t i = 0; i < inputs.size(); i++) {
+@@ -4902,15 +5000,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             task.id = rd.get_new_id();
+ 
+             task.tokens = std::move(inputs[i]);
+-            task.params = server_schema::eval_llama_cmpl_schema(
+-                    ctx_server.vocab,
+-                    params,
+-                    meta->logit_bias_eog,
+-                    data);
++            task.params = request_params;
+ 
+             task.apply_chat_session(chat_session);
+ 
+-            task.id_slot = json_value(data, "id_slot", -1);
++            task.id_slot = id_slot;
+             sse_ping_interval = task.params.sse_ping_interval;
+ 
+             // OAI-compat
+@@ -4929,6 +5023,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             tasks.push_back(std::move(task));
+         }
+ 
++        if (request_params.share_prompt) {
++            tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel);
++            if (tasks.size() != 1 || tasks.front().n_tokens_shared == 0) {
++                throw std::runtime_error("share_prompt could not form one shared task group");
++            }
++        }
++
+         rd.post_tasks(std::move(tasks), chat_session);
+     } catch (const std::exception & e) {
+         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index 6035324..8d6642e 100644
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -1893,8 +1893,8 @@ struct server_models_sse_client {
+     // note: if one error is received, it will stop further processing and return error result
+     server_task_result_ptr next(const std::function<bool()> & should_stop) {
+         while (true) {
+-            static const int http_polling_seconds = 1; // check should_stop every 1 second
+-            server_task_result_ptr result = queue_results.recv_with_timeout({client_id}, http_polling_seconds);
++            static constexpr auto http_polling_interval = std::chrono::seconds(1);
++            server_task_result_ptr result = queue_results.recv_with_timeout({client_id}, http_polling_interval);
+             if (result == nullptr) {
+                 // timeout, check stop condition
+                 if (should_stop()) {
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index 3352c3c..998df43 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -447,7 +447,8 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
+     // should never reach here
+ }
+ 
+-server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
++server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, std::chrono::milliseconds timeout) {
++    const auto deadline = std::chrono::steady_clock::now() + timeout;
+     while (true) {
+         std::unique_lock<std::mutex> lock(mutex_results);
+ 
+@@ -459,7 +460,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
+             }
+         }
+ 
+-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
++        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
+         if (!running) {
+             RES_DBG("%s : queue result stop\n", __func__);
+             std::terminate(); // we cannot return here since the caller is HTTP code
+@@ -549,7 +550,10 @@ bool server_response_reader::has_next() const {
+ // note: if one error is received, it will stop further processing and return error result
+ server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
+     while (true) {
+-        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
++        if (should_stop()) {
++            return nullptr;
++        }
++        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval);
+         if (result == nullptr) {
+             // timeout, check stop condition
+             if (should_stop()) {
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index 692255e..3c2d9f1 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -2,6 +2,7 @@
+ 
+ #include "server-task.h"
+ 
++#include <chrono>
+ #include <condition_variable>
+ #include <deque>
+ #include <exception>
+@@ -179,9 +180,9 @@ public:
+     // This function blocks the thread until there is a response for one of the id_tasks
+     server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);
+ 
+-    // same as recv(), but have timeout in seconds
++    // same as recv(), but with a bounded wait
+     // if timeout is reached, nullptr is returned
+-    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
++    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, std::chrono::milliseconds timeout);
+ 
+     // single-task version of recv()
+     server_task_result_ptr recv(int id_task);
+@@ -206,15 +207,15 @@ struct server_response_reader {
+     server_response & queue_results;
+     size_t received_count = 0;
+     bool cancelled = false;
+-    int polling_interval_seconds;
++    std::chrono::milliseconds polling_interval;
+ 
+     // tracking generation state and partial tool calls
+     // only used by streaming completions
+     std::vector<task_result_state> states;
+ 
+-    // should_stop function will be called each polling_interval_seconds
+-    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
+-        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
++    // should_stop is checked before each wait and at least once per polling_interval
++    server_response_reader(server_queue & queue_tasks, server_response & queue_results, std::chrono::milliseconds polling_interval)
++        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval(polling_interval) {}
+     ~server_response_reader() {
+         stop();
+     }
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 9a8d63f..2a8085e 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -193,6 +193,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("model_logprobs", params.model_logprobs))
+         ->set_desc("FreeComplete: include unmasked model log probabilities; requires one token, post-sampling probabilities and CPU sampling"));
+ 
++    add((new field_bool("share_prompt", params.share_prompt))
++        ->set_desc("FreeComplete: share a native one-token batch's common prompt prefix"));
++
+     //
+     // Speculative decoding params
+     //
+@@ -442,9 +445,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+                 throw std::runtime_error("token_prefix requires an array of bytes and n_predict=1");
+             }
+             for (const auto & value : data.at("token_prefix")) {
+-                if (!value.is_number_integer()) throw std::runtime_error("token_prefix contains a non-byte");
++                if (!value.is_number_integer() || value.get<double>() < 0 || value.get<double>() > 255) {
++                    throw std::runtime_error("token_prefix contains a non-byte");
++                }
+                 const int byte = value.get<int>();
+-                if (byte < 0 || byte > 255) throw std::runtime_error("token_prefix contains a non-byte");
+                 ctx.params.token_prefix.push_back(static_cast<unsigned char>(byte));
+             }
+         }));
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index f2fa8cc..9520ae7 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -8,6 +8,7 @@
+ #include <list>
+ #include <map>
+ #include <optional>
++#include <memory>
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -53,6 +54,7 @@ struct task_params {
+     bool stream          = false;
+     bool include_usage   = false;
+     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
++    bool share_prompt    = false; // opt in to the existing shared-prefix task owner
+     bool return_tokens   = false;
+     bool return_progress = false;
+ 
+@@ -79,6 +81,7 @@ struct task_params {
+     bool post_sampling_probs = false;
+ 
+     std::vector<unsigned char> token_prefix;
++    std::shared_ptr<const std::vector<llama_logit_bias>> token_prefix_bias;
+     struct common_params_sampling sampling;
+     struct common_params_speculative speculative;
+ 

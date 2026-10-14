@@ -1,0 +1,69 @@
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -77,4 +77,5 @@
+     bool post_sampling_probs = false;
+ 
++    std::vector<unsigned char> token_prefix;
+     struct common_params_sampling sampling;
+     struct common_params_speculative speculative;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -433,5 +433,19 @@
+         }));
+ 
++    add((new field_json("token_prefix"))
++        ->set_desc("FreeComplete: constrain one next-token distribution to a byte prefix; requires n_predict=1")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            if (ctx.params.n_predict != 1 || !data.at("token_prefix").is_array()) {
++                throw std::runtime_error("token_prefix requires an array of bytes and n_predict=1");
++            }
++            for (const auto & value : data.at("token_prefix")) {
++                if (!value.is_number_integer()) throw std::runtime_error("token_prefix contains a non-byte");
++                const int byte = value.get<int>();
++                if (byte < 0 || byte > 255) throw std::runtime_error("token_prefix contains a non-byte");
++                ctx.params.token_prefix.push_back(static_cast<unsigned char>(byte));
++            }
++        }));
++
+     add((new field_json("stop"))
+         ->set_desc("Specify stopping strings. Generation stops when one is produced, and the string is not included in the output")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1919,6 +1919,32 @@
+         if (task.need_sampling()) {
+             try {
+-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
++                if (task.params.token_prefix.empty()) {
++                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
++                } else {
++                    // A transient vocabulary mask is sampler state, not caller logit_bias.
++                    auto sampling = task.params.sampling;
++                    const auto & prefix = task.params.token_prefix;
++                    const int n_vocab = llama_vocab_n_tokens(vocab);
++                    sampling.logit_bias.reserve(sampling.logit_bias.size() + n_vocab);
++                    std::vector<char> piece(128);
++                    int matching = 0;
++                    for (llama_token token = 0; token < n_vocab; ++token) {
++                        int count = 0;
++                        if (!llama_vocab_is_control(vocab, token)) {
++                            count = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, false);
++                            if (count < 0) {
++                                piece.resize(-count);
++                                count = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, false);
++                            }
++                        }
++                        const bool match = count > 0 && std::equal(piece.begin(),
++                            piece.begin() + std::min(static_cast<size_t>(count), prefix.size()), prefix.begin(), [](char a, unsigned char b) { return static_cast<unsigned char>(a) == b; });
++                        if (match) ++matching;
++                        else sampling.logit_bias.push_back({token, -INFINITY});
++                    }
++                    if (matching == 0) throw std::runtime_error("token_prefix has no vocabulary continuation");
++                    slot.smpl.reset(common_sampler_init(model_tgt, sampling));
++                }
+             } catch (std::exception & e) {
+                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);

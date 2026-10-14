@@ -1,0 +1,164 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 9b784c5..cc929d2 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1913,6 +1913,14 @@ private:
+             return false;
+         }
+ 
++        if (task.params.model_logprobs &&
++            (!task.need_sampling() || task.params.n_predict != 1 ||
++             task.params.sampling.n_probs <= 0 || !task.params.post_sampling_probs ||
++             task.params.sampling.backend_sampling || spec)) {
++            send_error(task, "model_logprobs requires one token, post-sampling probabilities and no backend or speculative sampling", ERROR_TYPE_INVALID_REQUEST);
++            return false;
++        }
++
+         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
+ 
+         // initialize samplers
+@@ -2041,6 +2049,11 @@ private:
+         }
+ 
+         if (incomplete) {
++            // FreeComplete: probability records describe tokens, not completed text.
++            // Retain a split UTF-8 token's distribution without emitting its text.
++            if (slot.task->params.sampling.n_probs > 0) {
++                slot.add_token(result);
++            }
+             slot.has_next_token = true;
+         }
+ 
+@@ -2123,8 +2136,39 @@ private:
+         return slot.has_next_token; // continue
+     }
+ 
+-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
++    bool populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+         const size_t n_probs_request = slot.task->params.sampling.n_probs;
++        const float * model_logits = nullptr;
++        double model_max = -std::numeric_limits<double>::infinity();
++        double model_log_sum = 0.0;
++        if (slot.task->params.model_logprobs) {
++            // idx is relative to this decoded sub-batch, not the slot's reset i_batch.
++            if (llama_get_sampled_probs_ith(slot.ctx_tgt, idx) ||
++                llama_get_sampled_logits_ith(slot.ctx_tgt, idx) ||
++                llama_get_sampled_candidates_count_ith(slot.ctx_tgt, idx) > 0) {
++                return false;
++            }
++            model_logits = llama_get_logits_ith(slot.ctx_tgt, idx);
++            if (!model_logits) {
++                return false;
++            }
++            const int n_vocab = llama_vocab_n_tokens(vocab);
++            for (int id = 0; id < n_vocab; ++id) {
++                const double value = model_logits[id];
++                if (std::isnan(value) || value == std::numeric_limits<double>::infinity()) {
++                    return false;
++                }
++                model_max = std::max(model_max, value);
++            }
++            if (!std::isfinite(model_max)) {
++                return false;
++            }
++            double sum = 0.0;
++            for (int id = 0; id < n_vocab; ++id) {
++                sum += std::exp(double(model_logits[id]) - model_max);
++            }
++            model_log_sum = std::log(sum);
++        }
+ 
+         if (post_sampling) {
+             const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
+@@ -2153,6 +2197,13 @@ private:
+                     common_token_to_piece(ctx_tgt, cur_p->data[i].id, special),
+                     cur_p->data[i].p
+                 });
++                if (model_logits) {
++                    const double log_probability = (double(model_logits[cur_p->data[i].id]) - model_max) - model_log_sum;
++                    if (!std::isfinite(log_probability) || log_probability > 0.0) {
++                        return false;
++                    }
++                    result.probs.back().model_logprob = log_probability;
++                }
+             }
+         } else {
+             std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+@@ -2178,6 +2229,7 @@ private:
+                 });
+             }
+         }
++        return true;
+     }
+ 
+     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+@@ -4403,8 +4455,11 @@ private:
+             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+ 
+-            if (slot.task->params.sampling.n_probs > 0) {
+-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
++            if (slot.task->params.sampling.n_probs > 0 &&
++                !populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx)) {
++                send_error(slot, "Unmasked model probabilities are unavailable", ERROR_TYPE_SERVER);
++                slot.release();
++                return;
+             }
+ 
+             if (!process_token(result, slot)) {
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 3791e13..9a8d63f 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -190,6 +190,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
+         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
+ 
++    add((new field_bool("model_logprobs", params.model_logprobs))
++        ->set_desc("FreeComplete: include unmasked model log probabilities; requires one token, post-sampling probabilities and CPU sampling"));
++
+     //
+     // Speculative decoding params
+     //
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 3f30da2..4044f7b 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -267,6 +267,9 @@ json completion_token_output::to_json(bool post_sampling_probs) const {
+                 post_sampling_probs ? p.prob : logarithm(p.prob)
+             },
+         });
++        if (p.model_logprob) {
++            probs_for_token.back()["model_logprob"] = *p.model_logprob;
++        }
+     }
+     return probs_for_token;
+ }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 08f3cf0..f2fa8cc 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -7,6 +7,7 @@
+ #include <unordered_set>
+ #include <list>
+ #include <map>
++#include <optional>
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -73,6 +74,7 @@ struct task_params {
+     std::vector<std::string> antiprompt;
+     std::vector<std::string> response_fields;
+ 
++    bool model_logprobs = false;
+     bool timings_per_token   = false;
+     bool post_sampling_probs = false;
+ 
+@@ -343,6 +345,7 @@ struct completion_token_output {
+         llama_token tok;
+         std::string txt;
+         float prob;
++        std::optional<double> model_logprob = std::nullopt;
+     };
+     std::vector<prob_info> probs;
+ 
