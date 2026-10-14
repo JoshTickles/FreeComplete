@@ -105,6 +105,8 @@ final class AppModel: ObservableObject, TextObserver {
     @Published private(set) var status = "Waiting for Accessibility permission"
     @Published private(set) var accessibilityGranted: Bool
     @Published private(set) var acceptedWords: Int
+    /// Every Tab, grave, alternative or rewrite the user accepted.
+    @Published private(set) var acceptedCompletions: Int
     @Published private(set) var lastApp = "No text field active"
     @Published private(set) var suggestionPreview = ""
     /// Screen text behind the suggestion currently on screen, if any.
@@ -148,6 +150,7 @@ final class AppModel: ObservableObject, TextObserver {
         maxWords = max(1, min(12, defaults.integer(forKey: "maxWords") == 0 ? 4 : defaults.integer(forKey: "maxWords")))
         trailingSpace = defaults.bool(forKey: "trailingSpace")
         acceptedWords = defaults.integer(forKey: "acceptedWords")
+        acceptedCompletions = defaults.integer(forKey: "acceptedCompletions")
         accessibilityGranted = monitor.isTrusted
         let oldAppRules = defaults.data(forKey: "appRules").flatMap { try? JSONDecoder().decode([AppRule].self, from: $0) } ?? []
         appRules = oldAppRules.filter {
@@ -586,8 +589,7 @@ final class AppModel: ObservableObject, TextObserver {
             clearSuggestion()
             return false
         }
-        acceptedWords += accepted.split(whereSeparator: \.isWhitespace).count
-        defaults.set(acceptedWords, forKey: "acceptedWords")
+        recordAcceptance(accepted)
         if permitsRecording(snapshot), snapshot.before.utf16.count >= 40 {
             queueRecording(text: String(snapshot.before.suffix(120)) + String(accepted.prefix(80)),
                            for: snapshot, monitored: false)
@@ -688,10 +690,18 @@ final class AppModel: ObservableObject, TextObserver {
     func selectAlternative(_ index: Int) -> Bool {
         guard alternativeChoices.indices.contains(index), let snapshot, allows(snapshot),
               monitor.insert(alternativeChoices[index], matching: snapshot) else { return false }
+        recordAcceptance(alternativeChoices[index])
         pending?.cancel()
         pendingGeneration = nil
         clearSuggestion()
         return true
+    }
+
+    private func recordAcceptance(_ text: String) {
+        acceptedCompletions += 1
+        acceptedWords += text.split(whereSeparator: \.isWhitespace).count
+        defaults.set(acceptedCompletions, forKey: "acceptedCompletions")
+        defaults.set(acceptedWords, forKey: "acceptedWords")
     }
 
     func requestRewrite(correction: Bool) -> Bool {

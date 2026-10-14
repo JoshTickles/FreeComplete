@@ -9,6 +9,7 @@ final class FreeCompleteApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var permissionTimer: Timer?
     private var screenIndicator: AnyCancellable?
+    private var acceptCounter: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -19,6 +20,10 @@ final class FreeCompleteApp: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "FC"
         statusItem.button?.toolTip = "FreeComplete: local writing assistance"
         let menu = NSMenu()
+        let tally = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        tally.isEnabled = false
+        menu.addItem(tally)
+        menu.addItem(.separator())
         let settings = NSMenuItem(title: "Open FreeComplete", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -38,6 +43,12 @@ final class FreeCompleteApp: NSObject, NSApplicationDelegate {
             button.toolTip = usesScreen ? "FreeComplete: this suggestion uses screen text"
                 : "FreeComplete: local writing assistance"
         }
+        // "FC 42": accepted completions so far; the menu also shows the word total.
+        acceptCounter = model.$acceptedCompletions.combineLatest(model.$acceptedWords)
+            .sink { [weak self] completions, words in
+                self?.statusItem.button?.title = "FC \(completions.formatted())"
+                tally.title = "\(completions.formatted()) completions accepted · \(words.formatted()) words"
+            }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 660),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
