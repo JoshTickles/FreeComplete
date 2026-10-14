@@ -9,6 +9,22 @@ struct AppRule: Codable, Identifiable, Equatable {
     var recordWriting: Bool = true
     var instructions: String = ""
     var configured: Bool? = nil
+
+    /// Password managers and terminals start with suggestions, learning and screen
+    /// capture off: their fields hold secrets or commands, not prose. A rule the user
+    /// saves for one of these apps overrides the default.
+    static let sensitiveAppIDs: Set<String> = [
+        "com.1password.1password", "com.agilebits.onepassword7", "com.bitwarden.desktop",
+        "com.apple.Passwords", "com.dashlane.Dashlane", "com.lastpass.LastPass",
+        "com.callpod.keepermac.lite", "me.proton.pass.electron", "org.keepassxc.keepassxc",
+        "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "dev.warp.Warp-Stable",
+        "net.kovidgoyal.kitty", "org.alacritty", "com.github.wez.wezterm"
+    ]
+
+    static func base(for id: String) -> AppRule {
+        let sensitive = sensitiveAppIDs.contains(id)
+        return AppRule(id: id, enabled: !sensitive, recordWriting: !sensitive)
+    }
 }
 
 struct DomainRule: Codable, Identifiable, Equatable {
@@ -169,7 +185,12 @@ final class AppModel: ObservableObject, TextObserver {
     var historyError: String? { history.lastError }
     var displayedAppRules: [AppRule] {
         Array(Set(appRules.map(\.id)).union(observedAppIDs)).sorted()
-            .map { id in appRules.first(where: { $0.id == id }) ?? AppRule(id: id) }
+            .map(rule(for:))
+    }
+
+    /// The saved rule for an app, or its default (off for password managers and terminals).
+    func rule(for appID: String) -> AppRule {
+        appRules.first(where: { $0.id == appID }) ?? AppRule.base(for: appID)
     }
 
     var displayedDomainRules: [DomainRule] {
@@ -327,13 +348,13 @@ final class AppModel: ObservableObject, TextObserver {
 
     private func allows(_ snapshot: TextSnapshot) -> Bool {
         !IsSecureEventInputEnabled() && enabled
-            && appRules.first(where: { $0.id == snapshot.appID })?.enabled != false
+            && rule(for: snapshot.appID).enabled
             && sitePolicy(for: snapshot).suggest
     }
 
     private func permitsRecording(_ snapshot: TextSnapshot) -> Bool {
         allows(snapshot) && learningEnabled
-            && appRules.first(where: { $0.id == snapshot.appID })?.recordWriting != false
+            && rule(for: snapshot.appID).recordWriting
             && sitePolicy(for: snapshot).record
     }
 
@@ -355,7 +376,7 @@ final class AppModel: ObservableObject, TextObserver {
 
     private func options(for snapshot: TextSnapshot, maxWords: Int, vocabulary: Bool) -> PredictionOptions {
         PredictionOptions(globalInstructions: globalInstructions,
-                          appInstructions: appRules.first(where: { $0.id == snapshot.appID })?.instructions ?? "",
+                          appInstructions: rule(for: snapshot.appID).instructions,
                           domainInstructions: matchingDomainRule(snapshot.siteDomain)?.instructions ?? "",
                           vocabularyStrength: vocabulary && learningEnabled ? vocabularyStrength : 0,
                           vocabulary: vocabulary && learningEnabled
@@ -476,7 +497,8 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     private func continuation(for snapshot: TextSnapshot, before: String) async throws -> Continuation {
-        let excludedApps = Set(appRules.filter { !$0.enabled || !$0.recordWriting }.map(\.id))
+        let excludedApps = Set((Set(appRules.map(\.id)).union(AppRule.sensitiveAppIDs))
+            .filter { !rule(for: $0).enabled || !rule(for: $0).recordWriting })
         let captured = screenContextEnabled && !domainRules.contains(where: { !$0.enabled || !$0.recordWriting })
             ? screen.transcript(caret: snapshot.caret, field: monitor.inlineMetrics(for: snapshot).fieldFrame,
                                 excluding: excludedApps) : nil

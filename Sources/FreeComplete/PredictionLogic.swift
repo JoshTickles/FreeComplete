@@ -415,7 +415,9 @@ enum PredictionPrompt {
         if !options.appInstructions.isEmpty { preferences.append("In this app: " + options.appInstructions) }
         if !options.domainInstructions.isEmpty { preferences.append("On this website: " + options.domainInstructions) }
         if !preferences.isEmpty {
-            prefix += "\n## The writer's preferences (when two conflict, the later one wins)\n"
+            // Stated as rules the writer follows, not soft preferences: measurably better
+            // instruction use with the base model, with unchanged non-instruction outputs.
+            prefix += "\n## This person's writing rules (they follow these; a later rule overrides an earlier one)\n"
                 + preferences.joined(separator: "\n") + "\n"
         }
         return prefix + "\n## Writing\n"

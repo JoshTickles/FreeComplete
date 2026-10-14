@@ -299,9 +299,9 @@ struct SettingsView: View {
 
     private func ruleBinding<Value>(_ rule: AppRule, _ keyPath: WritableKeyPath<AppRule, Value>) -> Binding<Value> {
         Binding(get: {
-            model.appRules.first(where: { $0.id == rule.id })?[keyPath: keyPath] ?? rule[keyPath: keyPath]
+            model.rule(for: rule.id)[keyPath: keyPath]
         }, set: { value in
-            var changed = model.appRules.first(where: { $0.id == rule.id }) ?? rule
+            var changed = model.rule(for: rule.id)
             changed[keyPath: keyPath] = value
             model.setRule(changed)
         })
