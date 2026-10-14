@@ -8,8 +8,11 @@ Requires macOS 14+ on Apple Silicon, Swift 6.2, CMake, Apple command-line tools,
 
 ```sh
 ./scripts/build-app.sh
-open dist/FreeComplete.app
+cp -cR dist/FreeComplete.app /Applications/   # first install only
+open /Applications/FreeComplete.app
 ```
+
+Install into `/Applications` so Spotlight lists it. `cp -c` makes an APFS clone that shares storage with `dist/`, so it uses no extra space. Once installed, each `build-app.sh` run refreshes the `/Applications` copy the same way.
 
 The app is at `dist/FreeComplete.app` (about 3.4 GB). For distribution to other Macs, use an appropriate Developer ID signature and notarization. An ad-hoc signature changes on every build, so macOS drops the app's Accessibility approval and Keychain history access after each rebuild. A self-signed `FreeComplete Local` code-signing certificate gives a stable, certificate-based designated requirement for local use; local and ad-hoc signatures skip hardened runtime and Apple timestamping. After the first switch to a new signing identity, reset the old approval once (`tccutil reset Accessibility app.freecomplete`) and grant it again. The bundled model is Apache-2.0 licensed; third-party notices are in `Licenses/` and in the app's Resources. The runner binds to `127.0.0.1`, uses a fresh per-launch authentication key, starts lazily at first completion, and stops with the app.
 

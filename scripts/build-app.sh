@@ -209,3 +209,14 @@ if ! mv "$APP" "$OUTPUT"; then
     exit 1
 fi
 echo "Packaged $OUTPUT"
+
+# Keep an installed copy current. APFS clones share blocks with dist/, so the
+# 3.4 GB bundle costs no extra space. First install: see README.
+INSTALLED=/Applications/FreeComplete.app
+if [[ -d "$INSTALLED" ]]; then
+    rm -rf "$INSTALLED.new"
+    cp -cR "$OUTPUT" "$INSTALLED.new"
+    rm -rf "$INSTALLED"
+    mv "$INSTALLED.new" "$INSTALLED"
+    echo "Updated $INSTALLED"
+fi
