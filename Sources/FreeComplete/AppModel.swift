@@ -500,11 +500,12 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     private func continuation(for snapshot: TextSnapshot, before: String) async throws -> Continuation {
-        let excludedApps = Set((Set(appRules.map(\.id)).union(AppRule.sensitiveAppIDs))
-            .filter { !rule(for: $0).enabled || !rule(for: $0).recordWriting })
-        let captured = screenContextEnabled && !domainRules.contains(where: { !$0.enabled || !$0.recordWriting })
-            ? screen.transcript(caret: snapshot.caret, field: monitor.inlineMetrics(for: snapshot).fieldFrame,
-                                excluding: excludedApps) : nil
+        // Only the focused window is captured, so other apps never appear. An app whose
+        // recording is off is not captured at all.
+        let captured = screenContextEnabled && rule(for: snapshot.appID).recordWriting
+            && !domainRules.contains(where: { !$0.enabled || !$0.recordWriting })
+            ? screen.transcript(pid: snapshot.pid, caret: snapshot.caret,
+                                field: monitor.inlineMetrics(for: snapshot).fieldFrame) : nil
         let screenUse = captured.map { ScreenUse(app: snapshot.appName, capturedAt: $0.capturedAt, text: $0.text) }
         try Task.checkCancellation()
         var clipboardText: String?

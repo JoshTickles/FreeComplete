@@ -2,16 +2,16 @@ import AppKit
 import ScreenCaptureKit
 import Vision
 
-/// Opt-in screen reference text. Captures the column of the screen around the focused
-/// field (the conversation or document the user is replying to), OCRs it accurately
-/// in the background, and keeps a cleaned transcript ordered top to bottom. Requests
+/// Opt-in screen reference text. Captures only the window that holds the focused field,
+/// cropped to the field's column (the conversation or document the user is replying
+/// to), OCRs it accurately in the background, and keeps a cleaned transcript ordered top
+/// to bottom. Other apps, the menu bar and the desktop are never in the image. Requests
 /// read the latest transcript and never wait for OCR, so typing latency is unchanged.
 @MainActor
 final class ScreenContext {
     private struct Key: Equatable {
-        let displayID: CGDirectDisplayID
+        let pid: pid_t
         let column: ClosedRange<Int>
-        let excluded: Set<String>
     }
 
     private var cached: (key: Key, date: Date, text: String)?
@@ -21,21 +21,21 @@ final class ScreenContext {
 
     /// Latest transcript for this field and when it was captured, or nil. Starts a
     /// background refresh when stale.
-    func transcript(caret: CGRect, field: CGRect?, excluding appIDs: Set<String>) -> (text: String, capturedAt: Date)? {
+    func transcript(pid: pid_t, caret: CGRect, field: CGRect?) -> (text: String, capturedAt: Date)? {
         guard CGPreflightScreenCaptureAccess() else { return nil }
         let columnRect = field ?? caret
-        let column = Int(columnRect.minX)...Int(max(columnRect.minX + 1, columnRect.maxX))
+        let key = Key(pid: pid, column: Int(columnRect.minX)...Int(max(columnRect.minX + 1, columnRect.maxX)))
         let current = cached
         if refreshing == nil, current.map({ Date().timeIntervalSince($0.date) >= Self.freshFor }) ?? true
-            || current?.key.column != column || current?.key.excluded != appIDs {
+            || current?.key != key {
             refreshing = Task { @MainActor [weak self] in
-                let result = await Self.capture(caret: caret, field: field, excluding: appIDs)
+                let text = await Self.capture(pid: pid, caret: caret, field: field)
                 guard let self else { return }
-                if let result { self.cached = (result.key, Date(), result.text) }
+                if let text { self.cached = (key, Date(), text) }
                 self.refreshing = nil
             }
         }
-        guard let current, current.key.column == column, current.key.excluded == appIDs,
+        guard let current, current.key == key,
               Date().timeIntervalSince(current.date) < 30, !current.text.isEmpty else { return nil }
         return (current.text, current.date)
     }
@@ -46,46 +46,40 @@ final class ScreenContext {
         cached = nil
     }
 
-    private static func capture(caret: CGRect, field: CGRect?, excluding appIDs: Set<String>) async
-        -> (key: Key, text: String)? {
+    private static func capture(pid: pid_t, caret: CGRect, field: CGRect?) async -> String? {
         do {
-            let available = try await SCShareableContent.current
+            let available = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
             let point = CGPoint(x: caret.midX, y: caret.midY)
-            guard let display = available.displays.first(where: { $0.frame.contains(point) }) else { return nil }
-            let excluded = available.windows.filter {
-                $0.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier
-                    || appIDs.contains($0.owningApplication?.bundleIdentifier ?? "")
-            }
-            // SCDisplay frames and AX rects share the global top-left coordinate space.
-            let screen = display.frame
+            // The focused app's ordinary window under the caret. SCWindow frames and AX rects
+            // share the global top-left coordinate space.
+            guard let window = available.windows
+                .filter({ $0.owningApplication?.processID == pid && $0.windowLayer == 0 && $0.frame.contains(point) })
+                .min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else { return nil }
+            let frame = window.frame
             let columnRect = field ?? caret
             let margin: CGFloat = 40
-            let left = max(screen.minX, columnRect.minX - margin)
-            let right = min(screen.maxX, max(columnRect.maxX, caret.maxX) + margin)
+            let left = max(frame.minX, columnRect.minX - margin)
+            let right = min(frame.maxX, max(columnRect.maxX, caret.maxX) + margin)
             guard right - left > 20 else { return nil }
-            // Display-local crop of the full-height column around the field.
-            let source = CGRect(x: left - screen.minX, y: 0, width: right - left, height: screen.height)
+            // Window-local crop of the window's full height around the field column.
+            let source = CGRect(x: left - frame.minX, y: 0, width: right - left, height: frame.height)
             let config = SCStreamConfiguration()
             config.sourceRect = source
             let pixelScale = min(2.0, 2_400 / max(source.width, source.height))
             config.width = max(1, Int(source.width * pixelScale))
             config.height = max(1, Int(source.height * pixelScale))
             config.showsCursor = false
-            let filter = SCContentFilter(display: display, excludingWindows: excluded)
+            let filter = SCContentFilter(desktopIndependentWindow: window)
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             // The field's own text is already the writing; only its surroundings add context.
             let fieldInCrop = field.map {
-                CGRect(x: ($0.minX - left) / source.width, y: ($0.minY - screen.minY) / source.height,
+                CGRect(x: ($0.minX - left) / source.width, y: ($0.minY - frame.minY) / source.height,
                        width: $0.width / source.width, height: $0.height / source.height)
             }
-            let caretY = (caret.midY - screen.minY) / source.height
-            let text = try await Task.detached(priority: .userInitiated) {
+            let caretY = (caret.midY - frame.minY) / source.height
+            return try await Task.detached(priority: .userInitiated) {
                 try Self.transcribe(image, excludingTopLeft: fieldInCrop, caretY: caretY)
             }.value
-            let key = Key(displayID: display.displayID,
-                          column: Int(columnRect.minX)...Int(max(columnRect.minX + 1, columnRect.maxX)),
-                          excluded: appIDs)
-            return (key, text)
         } catch {
             return nil
         }
