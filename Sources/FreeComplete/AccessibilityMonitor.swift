@@ -92,9 +92,14 @@ final class AccessibilityMonitor {
     func scheduleRefresh(force: Bool = false) {
         refreshTask?.cancel()
         refreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(190))
+            // Read as soon as the app has applied the key; Chromium and Electron can publish
+            // the edit a beat later, so a second read catches it (unchanged text is ignored).
+            try? await Task.sleep(for: .milliseconds(25))
             guard !Task.isCancelled else { return }
             self?.refresh(force: force)
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            self?.refresh(force: false)
         }
     }
 

@@ -64,6 +64,14 @@ private struct PendingRemainder {
     }
 }
 
+/// A suggestion held across a keystroke, in case the key types its next characters.
+private struct TypeThrough {
+    let source: TextSnapshot
+    let text: String
+    let screen: ScreenUse?
+    let prefetch: Prefetch?
+}
+
 /// The continuation after a whole visible suggestion, generated while it is on screen.
 private struct Prefetch {
     let source: TextSnapshot
@@ -130,6 +138,7 @@ final class AppModel: ObservableObject, TextObserver {
     private var suggestion = ""
     private var pendingRemainder: PendingRemainder?
     private var prefetch: Prefetch?
+    private var typeThrough: TypeThrough?
     /// Tab/grave presses that arrived before the next part of the suggestion was on screen.
     private var queuedAccepts: [Bool] = []
     private var pauseUntil: Date = .distantPast
@@ -411,8 +420,49 @@ final class AppModel: ObservableObject, TextObserver {
         pendingGeneration = nil
         pendingRemainder = nil
         queuedAccepts.removeAll()
-        cancelPrefetch()
+        // A key may be the next character of the visible suggestion. Keep it (and the
+        // continuation prepared after it) until the field reports what was typed.
+        dropTypeThrough()
+        if let snapshot, !suggestion.isEmpty {
+            typeThrough = TypeThrough(source: snapshot, text: suggestion, screen: suggestionScreen, prefetch: prefetch)
+            prefetch = nil
+        } else {
+            cancelPrefetch()
+        }
         clearSuggestion()
+    }
+
+    private func dropTypeThrough() {
+        typeThrough?.prefetch?.task?.cancel()
+        typeThrough = nil
+    }
+
+    /// When the user types exactly the next characters of the suggestion, the rest is still
+    /// valid: show it at once instead of generating again.
+    private func continueTypedThrough(_ next: TextSnapshot) -> Bool {
+        guard let held = typeThrough else { return false }
+        typeThrough = nil
+        let source = held.source
+        let delta = next.range.location - source.range.location
+        guard next.pid == source.pid, CFEqual(next.element, source.element), delta > 0,
+              next.range.length == 0, ineligibility(next) == nil else {
+            held.prefetch?.task?.cancel()
+            return false
+        }
+        let typed = String(decoding: next.before.utf16.suffix(delta), as: UTF16.self)
+        guard held.text.hasPrefix(typed), (source.before + typed).hasSuffix(next.before) else {
+            held.prefetch?.task?.cancel()
+            return false
+        }
+        let rest = String(held.text.dropFirst(typed.count))
+        guard rest.contains(where: { $0.isLetter || $0.isNumber }) else {
+            held.prefetch?.task?.cancel()
+            return false
+        }
+        prefetch = held.prefetch
+        Trace.log("typed through \(typed.debugDescription), still showing \(rest.debugDescription)")
+        showContinuation(rest, for: next, prefetchNext: prefetch == nil, screen: held.screen)
+        return true
     }
 
     func textDidChange(_ newSnapshot: TextSnapshot?) {
@@ -432,6 +482,7 @@ final class AppModel: ObservableObject, TextObserver {
         guard let newSnapshot else {
             pendingRemainder = nil
             cancelPrefetch()
+            dropTypeThrough()
             if let previous { recordMonitored(previous) }
             lastApp = "No text field active"
             if IsSecureEventInputEnabled() { status = "Secure Input active; completions paused" }
@@ -444,6 +495,7 @@ final class AppModel: ObservableObject, TextObserver {
                 return
             }
         }
+        if continueTypedThrough(newSnapshot) { return }
         if let previous, (previous.pid != newSnapshot.pid || !CFEqual(previous.element, newSnapshot.element)) {
             recordMonitored(previous)
         }
@@ -480,8 +532,9 @@ final class AppModel: ObservableObject, TextObserver {
         let generation = beginGeneration()
         pending = Task { @MainActor [weak self] in
             defer { if self?.pendingGeneration == generation { self?.pendingGeneration = nil } }
-            // Short pause so fast typing does not queue a request per keystroke.
-            try? await Task.sleep(for: .milliseconds(90))
+            // A brief pause so a burst of keys does not start a search per keystroke; a
+            // newer key cancels this one between search rounds anyway.
+            try? await Task.sleep(for: .milliseconds(30))
             guard let self, !Task.isCancelled, self.allows(newSnapshot) else { return }
             let started = Date()
             do {

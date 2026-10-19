@@ -22,15 +22,9 @@ continuedPrefix.recordCompletion(probability: 0.9)
 precondition(finishedPrefix.rank > continuedPrefix.rank,
              "A completed insertion must outrank its lower-probability continuation")
 
-let unscoredCandidate = try! JSONDecoder().decode(CompletionCandidate.self,
-    from: Data("{\"id\":7,\"bytes\":[32],\"prob\":0.5}".utf8))
-precondition(unscoredCandidate.isValid(prefixPending: false) &&
-             !unscoredCandidate.isValid(prefixPending: true),
-             "Only a pending prefix requires the named original model likelihood")
-let nullScoredCandidate = try! JSONDecoder().decode(CompletionCandidate.self,
-    from: Data("{\"id\":7,\"bytes\":[32],\"prob\":0.5,\"model_logprob\":null}".utf8))
-precondition(!nullScoredCandidate.isValid(prefixPending: true),
-             "A null likelihood must not become a zero-score fallback")
+precondition(CompletionCandidate(id: 7, bytes: [32], prob: 0.5, model_logprob: nil).isValid(prefixPending: false) &&
+             !CompletionCandidate(id: 7, bytes: [32], prob: 0.5, model_logprob: nil).isValid(prefixPending: true),
+             "Only a pending prefix requires the original model likelihood")
 for value in [Double.nan, .infinity, -.infinity, 0.001] {
     precondition(!CompletionCandidate(id: 7, bytes: [32], prob: 0.5, model_logprob: value)
         .isValid(prefixPending: true), "Invalid original likelihood must reject a prefix distribution")
@@ -364,65 +358,6 @@ let unrelatedSite = SitePolicy.evaluate(
     rules: [("mybank.com", false, false)])
 precondition(unrelatedSite.suggest && unrelatedSite.record,
              "A known unrelated site remains usable")
-
-let requestGroups = CompletionRequestGroup.make(remainingPrefixes: [
-    [244, 143], [], [244], [244, 143], [], [143]
-])
-precondition(requestGroups.map { Array($0.remainingPrefix) } == [[244, 143], [], [244], [143]] &&
-             requestGroups.map(\.frontierIndices) == [[0, 3], [1, 4], [2], [5]],
-             "Grouping preserves first occurrence, raw split bytes, and original frontier indices")
-
-func completionRow(_ index: Int, token: Int) -> String {
-    "{\"index\":\(index),\"completion_probabilities\":[{\"top_probs\":[{\"id\":\(token),\"bytes\":[244],\"prob\":1}]}]}"
-}
-func decodeGroup(_ json: String) throws -> CompletionGroupResponse {
-    try JSONDecoder().decode(CompletionGroupResponse.self, from: Data(json.utf8))
-}
-let reversedResponse = try! decodeGroup("[\(completionRow(1, token: 31)),\(completionRow(0, token: 12))]")
-var mappedResponse = [RankedCompletion?](repeating: nil, count: 6)
-try! reversedResponse.store(in: &mappedResponse, for: requestGroups[0])
-precondition(mappedResponse[0]?.completion_probabilities[0].top_probs[0].id == 12 &&
-             mappedResponse[3]?.completion_probabilities[0].top_probs[0].id == 31 &&
-             mappedResponse[1] == nil,
-             "Out-of-order response indices map to the actual original frontier, not arrival order")
-for json in [completionRow(0, token: 7), "[\(completionRow(0, token: 7))]"] {
-    var singleton = [RankedCompletion?](repeating: nil, count: 1)
-    let group = CompletionRequestGroup(remainingPrefix: [], frontierIndices: [0])
-    try! decodeGroup(json).store(in: &singleton, for: group)
-    precondition(singleton[0]?.completion_probabilities[0].top_probs[0].id == 7,
-                 "Singleton object and singleton array both retain exact identity")
-}
-let invalidGroupResponses: [(String, Int)] = [
-    ("[]", 1),
-    ("[\(completionRow(0, token: 7))]", 2),
-    ("[\(completionRow(0, token: 7)),\(completionRow(1, token: 8))]", 1),
-    ("[\(completionRow(0, token: 7)),\(completionRow(0, token: 8))]", 2),
-    (completionRow(-1, token: 7), 1),
-    (completionRow(1, token: 7), 1),
-    (completionRow(0, token: 7), 2),
-    ("{\"completion_probabilities\":[]}", 1),
-    ("{\"index\":0}", 1),
-    ("{\"index\":0,\"completion_probabilities\":null}", 1),
-    ("[\(completionRow(0, token: 7)),{\"index\":1,\"completion_probabilities\":[{\"top_probs\":[{}]}]}]", 2),
-    ("{\"index\":0,\"completion_probabilities\":[],\"rows\":[]}", 2)
-]
-for (json, count) in invalidGroupResponses {
-    do {
-        var rows = [RankedCompletion?](repeating: nil, count: count)
-        let group = CompletionRequestGroup(remainingPrefix: [], frontierIndices: Array(0..<count))
-        try decodeGroup(json).store(in: &rows, for: group)
-        fatalError("Malformed completion group must fail as a whole: \(json)")
-    } catch {}
-}
-var untouchedRows = [RankedCompletion?](repeating: nil, count: 2)
-let duplicateRows = try! decodeGroup("[\(completionRow(0, token: 7)),\(completionRow(0, token: 8))]")
-do {
-    try duplicateRows.store(in: &untouchedRows,
-                            for: CompletionRequestGroup(remainingPrefix: [], frontierIndices: [0, 1]))
-    fatalError("Duplicate indices must reject the whole group")
-} catch {}
-precondition(untouchedRows.allSatisfy { $0 == nil },
-             "A rejected group must not partially replace frontier rows")
 
 let beamReserve = CompletionContextCapacity.reserve(generation: 64, branches: 9)
 precondition(beamReserve == 585 &&

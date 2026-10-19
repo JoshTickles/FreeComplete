@@ -9,9 +9,6 @@ LICENSE_SHA=cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
 CACHE="${FREECOMPLETE_BUILD_CACHE:-${HOME}/Library/Caches/FreeComplete}"
 MODEL="$CACHE/model/gemma-4-E2B.i1-Q4_K_M.gguf"
 MODEL_LICENSE="$CACHE/model/Apache-2.0.txt"
-TOKEN_PROBS_PATCH="$ROOT/scripts/llama-raw-token-probabilities.patch"
-TOKEN_PREFIX_PATCH="$ROOT/scripts/llama-token-prefix.patch"
-SHARED_PREFIX_PATCH="$ROOT/scripts/llama-shared-prefix.patch"
 DEST="$ROOT/dist"
 # A stable identity keeps macOS Accessibility approval across rebuilds; an ad-hoc
 # signature changes every build and invalidates it. Prefer an explicit identity,
@@ -33,9 +30,10 @@ for tool in git cmake swift codesign otool shasum plutil curl; do
     command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 1; }
 done
 mkdir -p "$CACHE/model"
-PATCH_SHA="$(shasum -a 256 "$TOKEN_PREFIX_PATCH" "$TOKEN_PROBS_PATCH" "$SHARED_PREFIX_PATCH" | cut -d ' ' -f 1 | shasum -a 256 | cut -d ' ' -f 1)"
-SOURCE="$CACHE/llama.cpp-$COMMIT-$PATCH_SHA"
-BUILD="$CACHE/llama-build-$COMMIT-$PATCH_SHA-arm64"
+SOURCE="$CACHE/llama.cpp-$COMMIT"
+BUILD="$CACHE/llama-lib-$COMMIT-arm64"
+# Static libllama/ggml staged for SwiftPM (see Package.swift).
+STAGED="$ROOT/.build/llama"
 fetch_verified() {
     local url="$1" destination="$2" expected="$3" part="$2.part"
     if [[ -f "$destination" && "$(shasum -a 256 "$destination" | cut -d ' ' -f 1)" == "$expected" ]]; then
@@ -73,41 +71,13 @@ if [[ "$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)" != "$COMMIT" ]]; 
     git -C "$SOURCE" checkout --detach "$COMMIT"
 fi
 [[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$COMMIT" ]] || exit 1
-# Construct the expected pinned tree plus our three original runtime patches.
-PATCH_INDEX="$(mktemp "$CACHE/freecomplete-patch-index.XXXXXX")"
-trap 'rm -f "$PATCH_INDEX" "$PATCH_INDEX.lock"' EXIT
-rm -f "$PATCH_INDEX"
-GIT_INDEX_FILE="$PATCH_INDEX" git -C "$SOURCE" read-tree "$COMMIT"
-for patch in "$TOKEN_PREFIX_PATCH" "$TOKEN_PROBS_PATCH" "$SHARED_PREFIX_PATCH"; do
-    if ! GIT_INDEX_FILE="$PATCH_INDEX" git -C "$SOURCE" apply --cached "$patch"; then
-        echo "Runtime patch does not match the pinned source: $patch" >&2
-        exit 1
-    fi
-done
-if ! git -C "$SOURCE" diff --cached --quiet ||
-   [[ -n "$(git -C "$SOURCE" ls-files --others --exclude-standard)" ]]; then
-    echo "Source cache has staged or untracked changes: $SOURCE" >&2
+# Only the library sources are built; they must be exactly the pinned upstream tree.
+LIBRARY_PATHS=(CMakeLists.txt cmake include src ggml vendor)
+if ! git -C "$SOURCE" diff --quiet HEAD -- "${LIBRARY_PATHS[@]}" ||
+   [[ -n "$(git -C "$SOURCE" ls-files --others --exclude-standard -- "${LIBRARY_PATHS[@]}")" ]]; then
+    echo "Source cache library sources differ from the pinned commit: $SOURCE" >&2
     exit 1
 fi
-# Compare the complete series. Later patches can modify an earlier patch's hunks,
-# so testing each patch in reverse cannot identify an already-patched checkout.
-if ! GIT_INDEX_FILE="$PATCH_INDEX" git -C "$SOURCE" diff --quiet; then
-    if ! git -C "$SOURCE" diff --quiet; then
-        echo "Source cache differs from the pinned or fully patched tree: $SOURCE" >&2
-        exit 1
-    fi
-    for patch in "$TOKEN_PREFIX_PATCH" "$TOKEN_PROBS_PATCH" "$SHARED_PREFIX_PATCH"; do
-        if ! git -C "$SOURCE" apply "$patch"; then
-            echo "Could not apply runtime patch: $patch" >&2
-            exit 1
-        fi
-    done
-fi
-if ! GIT_INDEX_FILE="$PATCH_INDEX" git -C "$SOURCE" diff --quiet; then
-    echo "Source cache differs from the exact pinned source plus our patches: $SOURCE" >&2
-    exit 1
-fi
-rm -f "$PATCH_INDEX" "$PATCH_INDEX.lock"
 
 cmake -S "$SOURCE" -B "$BUILD" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -120,27 +90,33 @@ cmake -S "$SOURCE" -B "$BUILD" \
     -DGGML_NATIVE=OFF \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_TOOLS=ON \
-    -DLLAMA_BUILD_SERVER=ON \
+    -DLLAMA_BUILD_TOOLS=OFF \
+    -DLLAMA_BUILD_SERVER=OFF \
+    -DLLAMA_BUILD_COMMON=OFF \
     -DLLAMA_BUILD_APP=OFF \
     -DLLAMA_BUILD_UI=OFF \
     -DLLAMA_USE_PREBUILT_UI=OFF \
     -DLLAMA_SUBPROCESS=OFF
-cmake --build "$BUILD" --config Release --target llama-server -j 4
-HELPER="$BUILD/bin/llama-server"
-[[ -x "$HELPER" ]] || { echo 'llama-server build produced no executable.' >&2; exit 1; }
-
-# Any Homebrew/private dylib dependency would make the bundle non-portable.
-otool -L "$HELPER" | sed -n '2,$s/^[[:space:]]*\([^[:space:]]*\).*/\1/p' | while IFS= read -r dependency; do
-    case "$dependency" in
-        /usr/lib/*|/System/Library/*) ;;
-        *) echo "Non-system llama-server dependency: $dependency" >&2; exit 1 ;;
-    esac
+cmake --build "$BUILD" --config Release --target llama -j 8
+rm -rf "$STAGED"
+mkdir -p "$STAGED/include" "$STAGED/lib"
+cp "$SOURCE/include/llama.h" "$SOURCE"/ggml/include/*.h "$STAGED/include/"
+for library in src/libllama.a ggml/src/libggml.a ggml/src/libggml-base.a ggml/src/libggml-cpu.a \
+               ggml/src/ggml-metal/libggml-metal.a ggml/src/ggml-blas/libggml-blas.a; do
+    [[ -f "$BUILD/$library" ]] || { echo "llama.cpp build produced no $library" >&2; exit 1; }
+    cp "$BUILD/$library" "$STAGED/lib/"
 done
 
 swift build --package-path "$ROOT" -c release --product FreeComplete
 EXECUTABLE="$ROOT/.build/release/FreeComplete"
 [[ -x "$EXECUTABLE" ]] || { echo 'FreeComplete build produced no executable.' >&2; exit 1; }
+# llama.cpp is linked statically; any non-system dylib would make the bundle non-portable.
+otool -L "$EXECUTABLE" | sed -n '2,$s/^[[:space:]]*\([^[:space:]]*\).*/\1/p' | while IFS= read -r dependency; do
+    case "$dependency" in
+        /usr/lib/*|/System/Library/*) ;;
+        *) echo "Non-system FreeComplete dependency: $dependency" >&2; exit 1 ;;
+    esac
+done
 
 mkdir -p "$DEST"
 STAGE="$(mktemp -d "$DEST/.FreeComplete.XXXXXX")"
@@ -155,13 +131,9 @@ trap cleanup EXIT
 APP="$STAGE/FreeComplete.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Licenses/llama.cpp"
 cp "$EXECUTABLE" "$APP/Contents/MacOS/FreeComplete"
-cp "$HELPER" "$APP/Contents/MacOS/llama-server"
 cp "$MODEL" "$APP/Contents/Resources/model.gguf"
 cp "$MODEL_LICENSE" "$APP/Contents/Resources/Licenses/Gemma-4-E2B-Apache-2.0.txt"
 cp "$ROOT/Licenses/THIRD_PARTY_NOTICES.txt" "$APP/Contents/Resources/Licenses/THIRD_PARTY_NOTICES.txt"
-cp "$TOKEN_PROBS_PATCH" "$APP/Contents/Resources/Licenses/llama.cpp/FreeComplete-raw-token-probabilities.patch"
-cp "$TOKEN_PREFIX_PATCH" "$APP/Contents/Resources/Licenses/llama.cpp/FreeComplete-token-prefix.patch"
-cp "$SHARED_PREFIX_PATCH" "$APP/Contents/Resources/Licenses/llama.cpp/FreeComplete-shared-prefix.patch"
 
 # Include original upstream notices for the statically linked dependencies, not only the top-level MIT license.
 while IFS= read -r -d '' file; do
@@ -189,16 +161,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 plutil -lint "$APP/Contents/Info.plist"
 
-# Sign nested executable first, then seal the app and its immutable model/resources.
+# Seal the app and its immutable model/resources.
 # Local and ad-hoc signatures are for this Mac only: no hardened runtime or Apple
 # timestamp. A distribution identity gets both.
 SIGN_ARGS=(--timestamp=none)
 if [[ "$SIGN_IDENTITY" != "-" && "$SIGN_IDENTITY" != "$LOCAL_SIGN_IDENTITY" ]]; then
     SIGN_ARGS=(--options runtime --timestamp)
 fi
-codesign --force --sign "$SIGN_IDENTITY" "${SIGN_ARGS[@]}" "$APP/Contents/MacOS/llama-server"
 codesign --force --sign "$SIGN_IDENTITY" "${SIGN_ARGS[@]}" "$APP"
-codesign --verify --strict "$APP/Contents/MacOS/llama-server"
 codesign --verify --strict "$APP"
 
 # Replace only the generated destination after staging has fully succeeded.

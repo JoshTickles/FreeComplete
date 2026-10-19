@@ -185,7 +185,7 @@ enum CompletionProbabilityGate {
     }
 }
 
-struct CompletionCandidate: Decodable {
+struct CompletionCandidate {
     let id: Int
     let bytes: [UInt8]
     let prob: Float32
@@ -592,67 +592,6 @@ enum SitePolicy {
         }
         return (suggest, suggest && record)
     }
-}
-
-struct CompletionRequestGroup {
-    let remainingPrefix: ArraySlice<UInt8>
-    var frontierIndices: [Int]
-
-    static func make<Prefixes: Sequence>(remainingPrefixes: Prefixes) -> [Self]
-        where Prefixes.Element == ArraySlice<UInt8> {
-        var groups: [Self] = []
-        for (index, prefix) in remainingPrefixes.enumerated() {
-            if let group = groups.firstIndex(where: { $0.remainingPrefix == prefix }) {
-                groups[group].frontierIndices.append(index)
-            } else {
-                groups.append(Self(remainingPrefix: prefix, frontierIndices: [index]))
-            }
-        }
-        return groups
-    }
-}
-
-struct RankedCompletion: Decodable {
-    struct Distribution: Decodable {
-        let top_probs: [CompletionCandidate]
-    }
-    let index: Int
-    let completion_probabilities: [Distribution]
-}
-
-struct CompletionGroupResponse: Decodable {
-    let rows: [RankedCompletion]
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let rows = try? container.decode([RankedCompletion].self) {
-            self.rows = rows
-        } else {
-            rows = [try container.decode(RankedCompletion.self)]
-        }
-    }
-
-    func store(in completions: inout [RankedCompletion?], for group: CompletionRequestGroup) throws {
-        let count = group.frontierIndices.count
-        guard count > 0, count <= UInt64.bitWidth, rows.count == count,
-              group.frontierIndices.allSatisfy({ completions.indices.contains($0) }) else {
-            throw MappingError.invalidRows
-        }
-        var seen: UInt64 = 0
-        for row in rows {
-            guard row.index >= 0, row.index < count else { throw MappingError.invalidRows }
-            let bit = UInt64(1) << row.index
-            guard seen & bit == 0 else { throw MappingError.invalidRows }
-            seen |= bit
-        }
-        // Validate the whole group before writing any row. No ordered copies
-        // are needed: the consumer expands the original frontier order.
-        for row in rows {
-            completions[group.frontierIndices[row.index]] = row
-        }
-    }
-
-    enum MappingError: Error { case invalidRows }
 }
 
 enum CompletionContextCapacity {

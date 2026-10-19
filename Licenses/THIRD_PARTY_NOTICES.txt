@@ -6,25 +6,7 @@ Pinned commit: f2cc7282ce0042641df55e0e563b75e824e2b647
 Copyright (c) 2023-2026 the ggml authors and other contributors.
 License: MIT. The complete upstream LICENSE and applicable vendored licenses and
 notices are included under Licenses/llama.cpp/ in the app bundle.
-FreeComplete applies an original local patch to the pinned server's probability
-recording: a split UTF-8 token retains its next-token distribution even before
-display text is complete. Opt-in model log probabilities preserve the unmasked
-likelihood separately from sampler-conditioned selection probabilities.
-The patch is included as Licenses/llama.cpp/FreeComplete-raw-token-probabilities.patch.
-FreeComplete also adds a byte-prefix constraint for each next-token distribution.
-It matches public vocabulary pieces across requests without changing typed bytes.
-Transient masks belong to sampler state, not serialized caller logit biases.
-The original patch is included as Licenses/llama.cpp/FreeComplete-token-prefix.patch.
-FreeComplete's original shared-prefix patch adds opt-in request admission
-and routes eligible batches to llama.cpp's existing shared-prefix task owner.
-It serializes root tasks in the unified KV pool while their child branches run
-together, and prepares each transient byte-prefix mask once per HTTP request.
-Response readers check disconnection at 100-millisecond intervals with monotonic
-deadlines, so unrelated result notifications cannot extend a cancellation wait.
-Upstream owns shared prefill, prompt/KV sharing, result indexing and cancellation;
-the patch does not introduce a separate inference engine or change model attention.
-The original patch is included as Licenses/llama.cpp/FreeComplete-shared-prefix.patch.
-Apply patches in this order: token-prefix, raw-token-probabilities, shared-prefix.
+FreeComplete links the pinned, unmodified llama.cpp and ggml libraries statically.
 
 Gemma 4 E2B public base model, importance-matrix Q4_K_M GGUF
 Base model: https://huggingface.co/google/gemma-4-E2B
