@@ -171,6 +171,7 @@ final class AccessibilityMonitor {
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
               let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else {
+            Trace.log("read \(appID): no focused element")
             focusedSnapshot = nil
             delegate?.textDidChange(nil)
             return
@@ -200,35 +201,144 @@ final class AccessibilityMonitor {
     }
 
     private func read(element: AXUIElement, pid: pid_t, appID: String, appName: String) -> TextSnapshot? {
-        guard !IsSecureEventInputEnabled() else { return nil }
-        guard let role = stringAttribute(kAXRoleAttribute, on: element),
-              [kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String].contains(role) else { return nil }
+        func fail(_ reason: String) -> TextSnapshot? {
+            Trace.log("read \(appID): \(reason)")
+            return nil
+        }
+        guard !IsSecureEventInputEnabled() else { return fail("secure input active") }
+        let role = stringAttribute(kAXRoleAttribute, on: element) ?? "none"
+        guard [kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String].contains(role) else {
+            // Rich web editors (contenteditable in browsers, Electron and WebKit apps) focus
+            // a group or the web area. They expose their text only through text markers.
+            if let root = editableRoot(of: element) {
+                return markerSnapshot(root: root, focused: element, pid: pid, appID: appID, appName: appName)
+                    ?? fail("editable \(role) without readable text markers")
+            }
+            return fail("focused role \(role) is not a text field")
+        }
         var subrole: CFTypeRef?
         let subroleStatus = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole)
         guard subroleStatus == .success || subroleStatus == .noValue || subroleStatus == .attributeUnsupported,
-              (subrole as? String) != (kAXSecureTextFieldSubrole as String) else { return nil }
+              (subrole as? String) != (kAXSecureTextFieldSubrole as String) else { return fail("secure field") }
         var rangeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-              let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() else { return nil }
+        let rangeStatus = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef)
+        guard rangeStatus == .success, let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() else {
+            return fail("no selected range (AXError \(rangeStatus.rawValue))")
+        }
         let rangeValue = rangeRef as! AXValue
         var range = CFRange(location: 0, length: 0)
         guard AXValueGetValue(rangeValue, .cfRange, &range), range.location >= 0,
-              range.length >= 0 else { return nil }
+              range.length >= 0 else { return fail("invalid selected range") }
         var countRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &countRef) == .success,
-              let count = countRef as? Int, count >= 0, range.location <= count,
-              range.length <= count - range.location else { return nil }
+        let countStatus = AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &countRef)
+        guard countStatus == .success, let count = countRef as? Int, count >= 0, range.location <= count,
+              range.length <= count - range.location else {
+            return fail("character count unusable (AXError \(countStatus.rawValue), caret \(range.location))")
+        }
         let beforeStart = max(0, range.location - 1200)
-        guard let before = text(in: CFRange(location: beforeStart, length: range.location - beforeStart), on: element) else { return nil }
+        guard let before = text(in: CFRange(location: beforeStart, length: range.location - beforeStart), on: element) else {
+            return fail("cannot read text before caret (caret \(range.location) of \(count))")
+        }
         let selected = range.length > 0 ? text(in: range, on: element) : ""
-        guard let selected, selected.utf16.count == range.length else { return nil }
+        guard let selected, selected.utf16.count == range.length else { return fail("cannot read selection") }
         let afterLength = min(180, count - range.location - range.length)
         let after = text(in: CFRange(location: range.location + range.length, length: afterLength), on: element) ?? ""
-        guard let caret = caretRect(on: element, at: range.location, count: count) else { return nil }
+        guard let caret = caretRect(on: element, at: range.location, count: count, previous: before.last)
+                ?? markerCaret(on: element) else {
+            return fail("no caret position (caret \(range.location) of \(count))")
+        }
         let site = siteContext(on: element)
         return TextSnapshot(element: element, pid: pid, appID: appID, appName: appName,
                             siteDomains: site.domains, siteDomain: site.domain, isWebContent: site.web,
                             before: before, after: after, selected: selected, range: range, caret: caret)
+    }
+
+    private func elementAttribute(_ name: String, on element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success, let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    /// The outermost editable element containing the focus, when the focus is inside an editor.
+    private func editableRoot(of element: AXUIElement) -> AXUIElement? {
+        elementAttribute("AXHighestEditableAncestor", on: element) ?? elementAttribute("AXEditableAncestor", on: element)
+    }
+
+    private func markerParameter(_ name: String, _ parameter: CFTypeRef, on element: AXUIElement) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, name as CFString, parameter, &value) == .success
+        else { return nil }
+        return value
+    }
+
+    private func selectionMarkers(_ elements: [AXUIElement]) -> AXTextMarkerRange? {
+        for element in elements {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, "AXSelectedTextMarkerRange" as CFString, &value) == .success,
+               let value, CFGetTypeID(value) == AXTextMarkerRangeGetTypeID() {
+                return (value as! AXTextMarkerRange)
+            }
+        }
+        return nil
+    }
+
+    private func markerRect(_ range: AXTextMarkerRange, on element: AXUIElement) -> CGRect? {
+        guard let value = markerParameter("AXBoundsForTextMarkerRange", range, on: element),
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var rect = CGRect.zero
+        guard AXValueGetValue(value as! AXValue, .cgRect, &rect), rect.isFinite,
+              rect.height > 2, rect.height < 100 else { return nil }
+        return rect
+    }
+
+    /// Caret from text markers: the right edge of the character before the caret, else the
+    /// collapsed selection. Chromium fields can provide this when range bounds fail.
+    private func markerCaret(on element: AXUIElement, root: AXUIElement? = nil) -> CGRect? {
+        let owner = root ?? element
+        guard let selection = selectionMarkers([element, owner]) else { return nil }
+        let caret = AXTextMarkerRangeCopyStartMarker(selection)
+        if let previous = markerParameter("AXPreviousTextMarkerForTextMarker", caret, on: owner),
+           CFGetTypeID(previous) == AXTextMarkerGetTypeID(),
+           var rect = markerRect(AXTextMarkerRangeCreate(nil, previous as! AXTextMarker, caret), on: owner),
+           rect.width < 300 {
+            rect.origin.x = rect.maxX
+            rect.size.width = 0
+            return rect
+        }
+        if var rect = markerRect(AXTextMarkerRangeCreate(nil, caret, caret), on: owner) ?? markerRect(selection, on: owner),
+           rect.width < 300 {
+            rect.size.width = 0
+            return rect
+        }
+        return nil
+    }
+
+    private func markerString(_ range: AXTextMarkerRange, on element: AXUIElement) -> String? {
+        markerParameter("AXStringForTextMarkerRange", range, on: element) as? String
+    }
+
+    /// Reads a rich editor through text markers. The editor root stands in for the field:
+    /// offsets count UTF-16 units from its start, so the same edit checks still apply.
+    private func markerSnapshot(root: AXUIElement, focused: AXUIElement, pid: pid_t,
+                                appID: String, appName: String) -> TextSnapshot? {
+        AXUIElementSetMessagingTimeout(root, 0.25)
+        guard let selection = selectionMarkers([focused, root]),
+              let whole = markerParameter("AXTextMarkerRangeForUIElement", root, on: root),
+              CFGetTypeID(whole) == AXTextMarkerRangeGetTypeID() else { return nil }
+        let wholeRange = whole as! AXTextMarkerRange
+        let start = AXTextMarkerRangeCopyStartMarker(selection)
+        let end = AXTextMarkerRangeCopyEndMarker(selection)
+        guard let fullBefore = markerString(AXTextMarkerRangeCreate(nil, AXTextMarkerRangeCopyStartMarker(wholeRange), start), on: root),
+              let selected = markerString(selection, on: root),
+              let caret = markerCaret(on: focused, root: root) else { return nil }
+        let fullAfter = markerString(AXTextMarkerRangeCreate(nil, end, AXTextMarkerRangeCopyEndMarker(wholeRange)), on: root) ?? ""
+        let before = String(decoding: fullBefore.utf16.suffix(1_200), as: UTF16.self)
+        let site = siteContext(on: root)
+        return TextSnapshot(element: root, pid: pid, appID: appID, appName: appName,
+                            siteDomains: site.domains, siteDomain: site.domain, isWebContent: site.web,
+                            before: before, after: String(fullAfter.prefix(180)), selected: selected,
+                            range: CFRange(location: fullBefore.utf16.count, length: selected.utf16.count), caret: caret)
     }
 
     private func stringAttribute(_ name: String, on element: AXUIElement) -> String? {
@@ -288,18 +398,38 @@ final class AccessibilityMonitor {
               range.length <= (whole as NSString).length - range.location else { return nil }
         return (whole as NSString).substring(with: NSRange(location: range.location, length: range.length))
     }
-    private func caretRect(on element: AXUIElement, at location: Int, count: Int) -> CGRect? {
-        var range = CFRange(location: min(location, max(0, count - 1)), length: count > 0 ? 1 : 0)
-        guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
-        var value: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString,
-                                                         parameter, &value) == .success,
-              let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
-        let rectValue = value as! AXValue
-        var rect = CGRect.zero
-        guard AXValueGetValue(rectValue, .cgRect, &rect), rect.isFinite, rect.width < 300, rect.height < 100 else { return nil }
-        if location == count { rect.origin.x = rect.maxX }
-        return rect
+    /// Caret rectangle in AX screen coordinates. Uses the glyph before the caret when it
+    /// is an ordinary character. After a newline (whose box spans the whole line) or at
+    /// the start of a field, it uses the zero-length range at the caret, then the glyph
+    /// after it.
+    private func caretRect(on element: AXUIElement, at location: Int, count: Int, previous: Character?) -> CGRect? {
+        func bounds(_ location: Int, _ length: Int) -> CGRect? {
+            var range = CFRange(location: location, length: length)
+            guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
+            var value: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString,
+                                                             parameter, &value) == .success,
+                  let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+            var rect = CGRect.zero
+            guard AXValueGetValue(value as! AXValue, .cgRect, &rect), rect.isFinite,
+                  rect.height > 2, rect.height < 100 else { return nil }
+            return rect
+        }
+        if let previous, !previous.isNewline, location > 0,
+           var rect = bounds(location - 1, 1), rect.width < 300 {
+            rect.origin.x = rect.maxX
+            rect.size.width = 0
+            return rect
+        }
+        if var rect = bounds(location, 0) {
+            rect.size.width = 0
+            return rect
+        }
+        if location < count, var rect = bounds(location, 1), rect.width < 300 {
+            rect.size.width = 0
+            return rect
+        }
+        return nil
     }
 
     func inlineMetrics(for snapshot: TextSnapshot) -> InlineMetrics {
@@ -377,6 +507,9 @@ final class AccessibilityMonitor {
         return value
     }
 
+    /// Marks keystrokes FreeComplete types itself, so its own key handler lets them pass.
+    static let syntheticEventTag: Int64 = 0x4643_4D50
+
     func insert(_ text: String, matching snapshot: TextSnapshot) -> Bool {
         let application = AXUIElementCreateApplication(snapshot.pid)
         AXUIElementSetMessagingTimeout(application, 0.25)
@@ -384,16 +517,46 @@ final class AccessibilityMonitor {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.pid,
               NSWorkspace.shared.frontmostApplication?.bundleIdentifier == snapshot.appID,
               AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-              let focused, CFGetTypeID(focused) == AXUIElementGetTypeID(),
-              CFEqual(focused, snapshot.element) else { return false }
-        guard let current = read(element: snapshot.element, pid: snapshot.pid, appID: snapshot.appID,
-                                 appName: snapshot.appName), current.fingerprint == snapshot.fingerprint,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.pid,
-              NSWorkspace.shared.frontmostApplication?.bundleIdentifier == snapshot.appID else { return false }
-        let result = AXUIElementSetAttributeValue(snapshot.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
-        guard result == .success else { return false }
+              let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+        let element = focused as! AXUIElement
+        // A rich editor's focus can be a child of the editor root the snapshot was read from.
+        guard CFEqual(element, snapshot.element) || editableRoot(of: element).map({ CFEqual($0, snapshot.element) }) == true,
+              let current = read(element: element, pid: snapshot.pid, appID: snapshot.appID, appName: snapshot.appName),
+              current.fingerprint == snapshot.fingerprint else {
+            Trace.log("insert refused: field changed since the suggestion")
+            return false
+        }
+        // Web and Electron editors often report success for an Accessibility insert
+        // without changing their content, so type there. Native fields take AX directly.
+        if !snapshot.isWebContent,
+           AXUIElementSetAttributeValue(snapshot.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+            Trace.log("inserted via Accessibility \(text.debugDescription)")
+        } else {
+            type(text, to: snapshot.pid)
+            Trace.log("inserted by typing \(text.debugDescription)")
+        }
         scheduleRefresh(force: true)
         return true
+    }
+
+    private func type(_ text: String, to pid: pid_t) {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let units = Array(text.utf16)
+        var index = 0
+        while index < units.count {
+            // Never split a surrogate pair across events.
+            var end = min(index + 16, units.count)
+            if end < units.count, UTF16.isLeadSurrogate(units[end - 1]) { end -= 1 }
+            var chunk = Array(units[index..<end])
+            for down in [true, false] {
+                guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
+                event.flags = []
+                event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
+                event.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventTag)
+                event.postToPid(pid)
+            }
+            index = end
+        }
     }
 
     private func installTap() {
@@ -418,25 +581,31 @@ final class AccessibilityMonitor {
     }
 
     private func handle(_ event: CGEvent) -> Bool {
+        // Keys FreeComplete types to insert a suggestion must not cancel the rest of it.
+        if event.getIntegerValueField(.eventSourceUserData) == Self.syntheticEventTag { return false }
         if IsSecureEventInputEnabled() {
             delegate?.invalidateSuggestion()
             scheduleRefresh()
             return false
         }
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
         guard let focusedSnapshot,
               NSWorkspace.shared.frontmostApplication?.processIdentifier == focusedSnapshot.pid,
               NSWorkspace.shared.frontmostApplication?.bundleIdentifier == focusedSnapshot.appID else {
+            if code == 48 { Trace.log("Tab passed through: no readable text field in the front app") }
             delegate?.invalidateSuggestion()
             scheduleRefresh(force: true)
             return false
         }
-        let code = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
         let modifiers = flags.intersection([.maskCommand, .maskControl, .maskAlternate])
-        if code == 48 && modifiers.isEmpty && !flags.contains(.maskShift),
-           delegate?.hasAcceptableSuggestion() == true {
-            acceptLater(full: false)
-            return true
+        if code == 48 && modifiers.isEmpty && !flags.contains(.maskShift) {
+            if delegate?.hasAcceptableSuggestion() == true {
+                Trace.log("Tab accepted")
+                acceptLater(full: false)
+                return true
+            }
+            Trace.log("Tab passed through: no suggestion visible")
         }
         // Use the emitted character for layout-dependent printable shortcuts.
         var character: UniChar = 0

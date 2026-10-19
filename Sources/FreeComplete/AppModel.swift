@@ -448,6 +448,7 @@ final class AppModel: ObservableObject, TextObserver {
             recordMonitored(previous)
         }
         lastApp = newSnapshot.appName
+        Trace.log("field \(newSnapshot.appID) before=\(Trace.tail(newSnapshot.before)) after-line-empty=\(newSnapshot.after.prefix(while: { !$0.isNewline }).allSatisfy(\.isWhitespace)) caret=\(Int(newSnapshot.caret.minX)),\(Int(newSnapshot.caret.minY)) h\(Int(newSnapshot.caret.height))")
         observedAppIDs.insert(newSnapshot.appID)
         observedDomains.formUnion(newSnapshot.siteDomains)
         if recordAllWriting, permitsRecording(newSnapshot), newSnapshot.selected.isEmpty,
@@ -471,7 +472,10 @@ final class AppModel: ObservableObject, TextObserver {
         }
         cancelPrefetch()
         queuedAccepts.removeAll()
-        guard eligible(newSnapshot) else { return }
+        if let reason = ineligibility(newSnapshot) {
+            Trace.log("skip: \(reason)")
+            return
+        }
         let marker = newSnapshot.fingerprint
         let generation = beginGeneration()
         pending = Task { @MainActor [weak self] in
@@ -479,25 +483,50 @@ final class AppModel: ObservableObject, TextObserver {
             // Short pause so fast typing does not queue a request per keystroke.
             try? await Task.sleep(for: .milliseconds(90))
             guard let self, !Task.isCancelled, self.allows(newSnapshot) else { return }
+            let started = Date()
             do {
                 let result = try await self.continuation(for: newSnapshot, before: newSnapshot.before)
-                guard !Task.isCancelled, self.snapshot?.fingerprint == marker,
-                      self.allows(newSnapshot), !result.text.isEmpty else { return }
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                guard !Task.isCancelled, self.snapshot?.fingerprint == marker, self.allows(newSnapshot) else {
+                    Trace.log("generated \(ms) ms but text changed meanwhile")
+                    return
+                }
+                guard !result.text.isEmpty else {
+                    Trace.log("generated \(ms) ms: empty")
+                    return
+                }
+                Trace.log("generated \(ms) ms: \(result.text.debugDescription) screen=\(result.screen != nil)")
                 self.showContinuation(result.text, for: newSnapshot, prefetchNext: true, screen: result.screen)
                 self.status = "Ready"
             } catch {
-                if !Task.isCancelled, !(error is CancellationError) { self.status = "Local model: \(error.localizedDescription)" }
+                if !Task.isCancelled, !(error is CancellationError) {
+                    Trace.log("generation failed: \(error.localizedDescription)")
+                    self.status = "Local model: \(error.localizedDescription)"
+                }
             }
         }
     }
 
-    private func eligible(_ snapshot: TextSnapshot) -> Bool {
-        allows(snapshot) && Date() >= pauseUntil && snapshot.selected.isEmpty
-            && snapshot.before.utf16.count >= 8
-            // Suggest only at the end of a line. Text later on the same line makes any
-            // insertion a mid-sentence rewrite; Cotypist also shows nothing there.
-            && snapshot.after.prefix(while: { !$0.isNewline }).allSatisfy(\.isWhitespace)
+    private func eligible(_ snapshot: TextSnapshot) -> Bool { ineligibility(snapshot) == nil }
+
+    /// Why no suggestion is generated for this field state, or nil when one should be.
+    private func ineligibility(_ snapshot: TextSnapshot) -> String? {
+        if !enabled { return "completions paused" }
+        if !rule(for: snapshot.appID).enabled { return "app \(snapshot.appID) is off" }
+        if IsSecureEventInputEnabled() { return "secure input" }
+        if !sitePolicy(for: snapshot).suggest { return "website excluded or unknown" }
+        if Date() < pauseUntil { return "dismissed with Esc" }
+        if !snapshot.selected.isEmpty { return "text selected" }
+        if snapshot.before.utf16.count < 8 { return "fewer than 8 characters before caret" }
+        // Suggest only at the end of a line. Text later on the same line makes any
+        // insertion a mid-sentence rewrite; Cotypist also shows nothing there.
+        if !snapshot.after.prefix(while: { !$0.isNewline }).allSatisfy(\.isWhitespace) {
+            return "text after caret on this line: \(Trace.tail(String(snapshot.after.prefix(16))))"
+        }
+        return nil
     }
+
+
 
     private func continuation(for snapshot: TextSnapshot, before: String) async throws -> Continuation {
         // Only the focused window is captured, so other apps never appear. An app whose
@@ -528,8 +557,14 @@ final class AppModel: ObservableObject, TextObserver {
     /// grave accept exactly what is visible. Then, while the user reads it, generate
     /// what follows the whole suggestion so accepting it continues without a wait.
     private func showContinuation(_ text: String, for snapshot: TextSnapshot, prefetchNext: Bool, screen: ScreenUse?) {
-        let shown = overlay.showInline(text, at: snapshot.caret, metrics: monitor.inlineMetrics(for: snapshot))
-        guard !shown.isEmpty else { clearSuggestion(); return }
+        let metrics = monitor.inlineMetrics(for: snapshot)
+        let shown = overlay.showInline(text, at: snapshot.caret, metrics: metrics)
+        guard !shown.isEmpty else {
+            Trace.log("not shown: nothing fits (caret x \(Int(snapshot.caret.maxX)), h \(Int(snapshot.caret.height)), field \(metrics.fieldFrame.map { "\(Int($0.minX))…\(Int($0.maxX))" } ?? "unknown"))")
+            clearSuggestion()
+            return
+        }
+        Trace.log("shown \(shown.debugDescription) font=\(metrics.fontName ?? "?") \(metrics.fontSize.map { "\($0)" } ?? "?")")
         suggestion = shown
         suggestionPreview = shown
         suggestionScreen = screen
