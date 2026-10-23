@@ -1,5 +1,5 @@
 # FreeComplete
-
+_Note: Readme written by local AI model_
 > **Pre-release:** FreeComplete is under active development and is not ready for general release. This repository is a development snapshot, not a stable release.
 >
 > Core autocomplete works, but interface polish, supported-app verification, power/battery controls and detailed savings statistics remain in progress. Terminal support is unverified. See [the release-polish plan](PLAN.md#current-release-polish-plan) for scope and known verification gaps.
