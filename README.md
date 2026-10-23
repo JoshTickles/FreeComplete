@@ -1,5 +1,9 @@
 # FreeComplete
 
+> **Pre-release:** FreeComplete is under active development and is not ready for general release. This repository is a development snapshot, not a stable release.
+>
+> Core autocomplete works, but interface polish, supported-app verification, power/battery controls and detailed savings statistics remain in progress. A model smoke probe also exposed a Metal shutdown assertion that still needs investigation. Terminal support is unverified. See [the release-polish plan](PLAN.md#current-release-polish-plan) for scope and known verification gaps.
+
 FreeComplete is an original, free, on-device macOS writing assistant. It bundles a public Gemma 4 E2B **base-model i1-Q4_K_M** GGUF and runs it inside the app through a statically linked, pinned llama.cpp (Metal). Autocomplete uses raw token distributions and bounded ranked search, not chat replies. No Ollama process, account, cloud API or subscription is required. The public GGUF differs from Cotypist's installed file. FreeComplete uses no Cotypist code, assets, installed weights or private profiles.
 
 ## Build and run
@@ -37,6 +41,10 @@ Opt-in screen context captures only the window that holds the focused field (nev
 Settings include a global enable switch, maximum suggestion length, spacing, global instructions, per-app and per-website enable/learning/instructions, and optional screen OCR or clipboard context. Website rules use HTTP(S) document URLs exposed through Accessibility, including known enclosing frames; a parent-domain exclusion cannot be overridden by a subdomain. If a web field's outer URL cannot be established, configured suggestion and recording exclusions fail closed independently. Observed app and website names appear in settings only for this session; only rules you configure are saved. Screen OCR requires separate Screen Recording permission, captures the display containing the caret and excludes windows belonging to excluded apps; it is suspended entirely while any website has an exclusion so another visible browser window cannot bypass it. Clipboard and screen text are used only when enabled, on this Mac, and not saved; concealed/transient clipboard items are skipped. macOS may ask before clipboard access. Writing history is off by default. With explicit opt-in, short samples from accepted completions are AES-GCM encrypted with a Keychain key; an additional off-by-default switch also records monitored writing after a pause or when leaving a field. Text under 40 characters is skipped. History is scoped by app and website, capped at 2,000 samples of at most 200 characters, and clearable from Privacy. Vocabulary influence can be turned off or adjusted, and app/website recording can be disabled independently. The helper is never given an external network host.
 
 Password managers (1Password, Bitwarden, Apple Passwords, Dashlane, LastPass, Keeper, Proton Pass, KeePassXC) and terminals (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, WezTerm) start with suggestions, learning and screen capture off. Enable one in the Apps tab to override the default.
+
+Terminal support is not verified. FreeComplete requires readable Accessibility text and a reported caret position. It does not reconstruct the active input or guess the caret from screenshot text. Custom-drawn terminal panes without those values receive no suggestions. The experimental terminal OCR path was removed after a controlled image probe showed that it treated an entire OCR fragment, including text after the caret, as input before the caret.
+
+Cotypist's [terminal compatibility documentation](https://cotypist.app/compatibility#terminals) describes a different boundary: automatic activation in recognized AI-agent prompts, with ordinary shell commands requiring manual force activation. Its Orca support covers Claude Code and Codex, not every agent. Ghostty, cmux and Warp are listed as unsupported. These are vendor claims, not verification of the installed Cotypist binary's extraction mechanism.
 
 ### Suggestion quality
 

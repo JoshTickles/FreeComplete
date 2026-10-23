@@ -6,3 +6,11 @@ build/
 *.gguf
 *.dSYM/
 .DS_Store
+.cache/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
