@@ -27,8 +27,29 @@ private enum InferenceError: LocalizedError {
     nonisolated static let contextSize = Int(LlamaEngine.contextSize)
 
     private nonisolated static let queue = DispatchQueue(label: "app.freecomplete.llama", qos: .userInteractive)
-    private var engine: LlamaEngine?
-    private var loading: Task<LlamaEngine, Error>?
+    /// The serial queue owns native resources, even while a load result is still
+    /// waiting for the main actor. Tasks may retain the Swift engine after stop.
+    private final class ModelSession: @unchecked Sendable {
+        var engine: LlamaEngine?
+        var stopped = false
+
+        func load(_ path: String) throws -> LlamaEngine {
+            guard !stopped else { throw CancellationError() }
+            if let engine { return engine }
+            let loaded = try LlamaEngine(modelPath: path)
+            engine = loaded
+            return loaded
+        }
+
+        func stop() {
+            stopped = true
+            engine?.close()
+            engine = nil
+        }
+    }
+
+    private var session = ModelSession()
+    private var modelTask: Task<LlamaEngine, Error>?
     private var consecutiveFailures = 0
     private var nextAttempt = Date.distantPast
 
@@ -38,21 +59,25 @@ private enum InferenceError: LocalizedError {
     }
 
     func stop() {
-        loading?.cancel()
-        loading = nil
-        if let engine { Self.queue.async { _ = engine } }
-        engine = nil
+        let stoppedSession = session
+        session = ModelSession()
+        modelTask?.cancel()
+        modelTask = nil
+        // Termination cannot leave teardown queued behind process exit. Drain native
+        // work and close resources before returning, including a just-finished load.
+        Self.queue.sync { stoppedSession.stop() }
         state = "Stopped"
         consecutiveFailures = 0
         nextAttempt = .distantPast
     }
 
     private func ready() async throws -> LlamaEngine {
-        if let engine { return engine }
         if Date() < nextAttempt {
             throw InferenceError.retryAfter(max(1, Int(nextAttempt.timeIntervalSinceNow.rounded(.up))))
         }
-        if loading == nil {
+        try Task.checkCancellation()
+        let session = self.session
+        if modelTask == nil {
             var model = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/model.gguf")
             #if DEBUG
             // Explicit development-only override; release bundles always use their own model.
@@ -61,18 +86,20 @@ private enum InferenceError: LocalizedError {
             guard FileManager.default.fileExists(atPath: model.path) else { throw InferenceError.missingModel }
             state = "Loading model"
             let path = model.path
-            loading = Task { try await Self.onQueue { try LlamaEngine(modelPath: path) } }
+            modelTask = Task { try await Self.onQueue { try session.load(path) } }
         }
-        guard let pending = loading else { throw InferenceError.stopped }
+        guard let pending = modelTask else { throw InferenceError.stopped }
         do {
             let loaded = try await pending.value
-            loading = nil
-            engine = loaded
+            guard self.session === session else { throw CancellationError() }
+            try Task.checkCancellation()
             state = "Ready"
             consecutiveFailures = 0
             return loaded
         } catch {
-            loading = nil
+            guard self.session === session else { throw CancellationError() }
+            if error is CancellationError { throw error }
+            modelTask = nil
             consecutiveFailures += 1
             nextAttempt = Date().addingTimeInterval(min(60, pow(2, Double(consecutiveFailures))))
             state = "Model failed to load"
@@ -88,8 +115,13 @@ private enum InferenceError: LocalizedError {
 
     private func run<T>(_ engine: LlamaEngine, _ body: @escaping @Sendable (LlamaEngine) throws -> T) async throws -> T {
         try Task.checkCancellation()
-        let value = try await Self.onQueue { try body(engine) }
+        let session = self.session
+        let value = try await Self.onQueue {
+            guard !session.stopped, session.engine === engine else { throw CancellationError() }
+            return try body(engine)
+        }
         try Task.checkCancellation()
+        guard self.session === session else { throw CancellationError() }
         return value
     }
 
@@ -97,6 +129,7 @@ private enum InferenceError: LocalizedError {
         if let maxTokens, maxTokens <= 0 { throw InferenceError.invalidTokenCount }
         guard maxWords > 0 else { throw InferenceError.invalidWordCount }
         try Task.checkCancellation()
+        let session = self.session
         let engine = try await ready()
         let prompt: String
         var tokenPrefix: [UInt8] = []
@@ -177,6 +210,7 @@ private enum InferenceError: LocalizedError {
             }
         }
         try Task.checkCancellation()
+        guard self.session === session else { throw CancellationError() }
         return text
     }
 

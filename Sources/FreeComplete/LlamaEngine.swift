@@ -47,6 +47,7 @@ final class LlamaEngine: @unchecked Sendable {
     private var batch: llama_batch
     private var cached: [Int32: [Int32]] = [:]
     private var prefixMasks: [[UInt8]: [Int32]] = [:]
+    private var closed = false
 
     /// Loads the model.
     init(modelPath: String) throws {
@@ -90,7 +91,13 @@ final class LlamaEngine: @unchecked Sendable {
         batch = llama_batch_init(Self.batchCapacity, 0, 1)
     }
 
-    deinit {
+    deinit { close() }
+
+    /// Release native resources on the owning queue, independently of Swift task
+    /// references that can outlive a stopped inference session.
+    func close() {
+        guard !closed else { return }
+        closed = true
         llama_batch_free(batch)
         llama_free(context)
         llama_model_free(model)
@@ -99,6 +106,7 @@ final class LlamaEngine: @unchecked Sendable {
     func pieceBytes(_ token: Int) -> [UInt8] { token >= 0 && token < pieces.count ? pieces[token] : [] }
 
     func tokenize(_ text: String, addSpecial: Bool) throws -> [Int32] {
+        guard !closed else { throw CancellationError() }
         let utf8 = Array(text.utf8CString.dropLast())
         var tokens = [Int32](repeating: 0, count: utf8.count + 8)
         var count = llama_tokenize(vocab, utf8, Int32(utf8.count), &tokens, Int32(tokens.count), addSpecial, false)
@@ -114,6 +122,7 @@ final class LlamaEngine: @unchecked Sendable {
     /// tokens whose bytes agree with the pending bytes and adds the unmasked model log
     /// probability. Probabilities are a Float32 softmax over the retained top twenty.
     func next(_ sequences: [[Int32]], prefixes: [[UInt8]]) throws -> [[Candidate]] {
+        guard !closed else { throw CancellationError() }
         let rows = try evaluate(sequences)
         let logits = try rows.map { row -> UnsafeMutablePointer<Float> in
             guard let pointer = llama_get_logits_ith(context, row) else { throw Failure.decode(-1) }
@@ -132,6 +141,7 @@ final class LlamaEngine: @unchecked Sendable {
 
     /// Greedy continuation with stop strings (rewrites).
     func greedy(_ prompt: [Int32], maxTokens: Int, stops: [String]) throws -> (text: String, stop: Stop) {
+        guard !closed else { throw CancellationError() }
         var tokens = prompt
         var bytes: [UInt8] = []
         for _ in 0..<maxTokens {

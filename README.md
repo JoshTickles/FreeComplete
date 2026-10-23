@@ -2,7 +2,7 @@
 
 > **Pre-release:** FreeComplete is under active development and is not ready for general release. This repository is a development snapshot, not a stable release.
 >
-> Core autocomplete works, but interface polish, supported-app verification, power/battery controls and detailed savings statistics remain in progress. A model smoke probe also exposed a Metal shutdown assertion that still needs investigation. Terminal support is unverified. See [the release-polish plan](PLAN.md#current-release-polish-plan) for scope and known verification gaps.
+> Core autocomplete works, but interface polish, supported-app verification, power/battery controls and detailed savings statistics remain in progress. Terminal support is unverified. See [the release-polish plan](PLAN.md#current-release-polish-plan) for scope and known verification gaps.
 
 FreeComplete is an original, free, on-device macOS writing assistant. It bundles a public Gemma 4 E2B **base-model i1-Q4_K_M** GGUF and runs it inside the app through a statically linked, pinned llama.cpp (Metal). Autocomplete uses raw token distributions and bounded ranked search, not chat replies. No Ollama process, account, cloud API or subscription is required. The public GGUF differs from Cotypist's installed file. FreeComplete uses no Cotypist code, assets, installed weights or private profiles.
 
@@ -73,5 +73,13 @@ Real production diagnostics stop the tested year and compound chains and preserv
 ./scripts/test-prediction.sh
 swift build -c release
 ```
+
+After building the native libraries, run the opt-in real-model lifecycle checks with a local copy of the pinned public model:
+
+```sh
+./scripts/test-inference.sh /path/to/model.gguf
+```
+
+These checks run generation, repeated stop, model reload and cancellation/recovery in separate processes and require clean process exits. They do not grant permissions, read text fields or control another app. Native resources now close synchronously on their owning queue before `stop()` returns; task-held references cannot keep a stopped model's Metal resources alive until process exit. Stop waits for native work already on that queue, so a long in-progress rewrite can delay shutdown.
 
 The test runner checks bounded multi-token source rewind, exact Unicode bytes, prefix/ordinary Float32 gate boundaries, production candidate decoding and validation, raw prefix consumption with surplus preservation, phase-aware ranking, stable byte-constraint grouping, indexed response mapping and rejection without partial mutation, aggregate context capacity and overflow, raw partial-word and multilingual word-boundary insertion, alternative identity/spacing, punctuation, correction JSON completeness and selection whitespace, synonym selection eligibility, website parsing, nested-frame exclusions, unknown-site fail-closed behavior, and absence of unconsented context. The built-in editor exercises bundled model generation without Accessibility. Actual cross-app observation/insertion and screen OCR require the corresponding macOS permissions and separate verification. [PLAN.md](PLAN.md) distinguishes earlier exercised UI behavior from current-build verification.
