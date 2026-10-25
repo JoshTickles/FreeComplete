@@ -22,7 +22,7 @@ let package = Package(
                 .linkedLibrary("ggml-cpu"), .linkedLibrary("ggml-metal"), .linkedLibrary("ggml-blas"),
                 .linkedLibrary("c++"),
                 .linkedFramework("Metal"), .linkedFramework("MetalKit"),
-                .linkedFramework("Accelerate"), .linkedFramework("Foundation")
+                .linkedFramework("Accelerate"), .linkedFramework("Foundation"), .linkedFramework("IOKit")
             ]
         )
     ]

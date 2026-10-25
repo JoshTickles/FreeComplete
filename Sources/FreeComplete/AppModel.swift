@@ -72,8 +72,8 @@ private struct TypeThrough {
     let prefetch: Prefetch?
 }
 
-/// The continuation after a whole visible suggestion, generated while it is on screen.
-private struct Prefetch {
+/// The next continuation, either prefetched or requested after an accepted insertion.
+private final class Prefetch {
     let source: TextSnapshot
     let expectedBefore: String
     var result: Continuation?
@@ -81,6 +81,11 @@ private struct Prefetch {
     /// Set when the whole visible suggestion is accepted: until then a further Tab
     /// belongs to this result. Bounded so a result that never shows cannot hold Tab.
     var armedUntil: Date?
+
+    init(source: TextSnapshot, expectedBefore: String) {
+        self.source = source
+        self.expectedBefore = expectedBefore
+    }
 
     func matches(_ next: TextSnapshot) -> Bool {
         next.pid == source.pid && CFEqual(next.element, source.element)
@@ -92,14 +97,40 @@ private struct Prefetch {
 
 @MainActor
 final class AppModel: ObservableObject, TextObserver {
-    @Published var enabled: Bool { didSet { defaults.set(enabled, forKey: "enabled"); refreshCurrent(); preloadModel() } }
-    @Published var screenContextEnabled: Bool {
-        didSet { defaults.set(screenContextEnabled, forKey: "screenContext"); if !screenContextEnabled { screen.clearCache() } }
+    @Published var enabled: Bool {
+        didSet { defaults.set(enabled, forKey: "enabled"); reconcileMonitoring() }
     }
-    @Published var clipboardContextEnabled: Bool { didSet { defaults.set(clipboardContextEnabled, forKey: "clipboardContext") } }
-    @Published var learningEnabled: Bool { didSet { defaults.set(learningEnabled, forKey: "learning"); if !learningEnabled { pendingRecording?.cancel() } } }
-    @Published var recordAllWriting: Bool { didSet { defaults.set(recordAllWriting, forKey: "recordAllWriting"); if !recordAllWriting { pendingRecording?.cancel() } } }
-    @Published var globalInstructions: String { didSet { defaults.set(globalInstructions, forKey: "instructions") } }
+    @Published var powerMode: PowerMode {
+        didSet {
+            defaults.set(powerMode.rawValue, forKey: "powerMode")
+            applyPowerPolicy(SystemPowerMonitor.current())
+        }
+    }
+    @Published private(set) var effectivePowerDescription: String
+    @Published var typingWordsPerMinute: Double {
+        didSet {
+            let normalized = typingWordsPerMinute.isFinite ? min(200, max(10, typingWordsPerMinute)) : 40
+            if typingWordsPerMinute != normalized { typingWordsPerMinute = normalized }
+            defaults.set(normalized, forKey: "typingWordsPerMinute")
+        }
+    }
+    @Published private(set) var savings: SavingsStatistics
+    @Published private(set) var savingsError: String?
+    @Published var screenContextEnabled: Bool {
+        didSet { defaults.set(screenContextEnabled, forKey: "screenContext"); refreshCurrent() }
+    }
+    @Published var clipboardContextEnabled: Bool {
+        didSet { defaults.set(clipboardContextEnabled, forKey: "clipboardContext"); refreshCurrent() }
+    }
+    @Published var learningEnabled: Bool {
+        didSet { defaults.set(learningEnabled, forKey: "learning"); refreshCurrent() }
+    }
+    @Published var recordAllWriting: Bool {
+        didSet { defaults.set(recordAllWriting, forKey: "recordAllWriting"); refreshCurrent() }
+    }
+    @Published var globalInstructions: String {
+        didSet { defaults.set(globalInstructions, forKey: "instructions"); refreshCurrent() }
+    }
     @Published var appRules: [AppRule] { didSet { saveRules() } }
     @Published var domainRules: [DomainRule] {
         didSet {
@@ -112,9 +143,6 @@ final class AppModel: ObservableObject, TextObserver {
     @Published var trailingSpace: Bool { didSet { defaults.set(trailingSpace, forKey: "trailingSpace") } }
     @Published private(set) var status = "Waiting for Accessibility permission"
     @Published private(set) var accessibilityGranted: Bool
-    @Published private(set) var acceptedWords: Int
-    /// Every Tab, grave, alternative or rewrite the user accepted.
-    @Published private(set) var acceptedCompletions: Int
     @Published private(set) var lastApp = "No text field active"
     @Published private(set) var suggestionPreview = ""
     /// Screen text behind the suggestion currently on screen, if any.
@@ -123,12 +151,26 @@ final class AppModel: ObservableObject, TextObserver {
     @Published private(set) var lastScreenUse: ScreenUse?
     @Published private(set) var demoOutput = ""
     @Published private(set) var demoBusy = false
+    @Published private(set) var demoError: String?
 
     private let defaults = UserDefaults.standard
     private let monitor = AccessibilityMonitor()
     private let inference = LocalInference()
     private let overlay = SuggestionOverlay()
     private let screen = ScreenContext()
+    private let powerMonitor = SystemPowerMonitor()
+    private var powerPolicy: PowerPolicy
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    private var sleeping = false
+    private var sessionActive = true
+    private var terminated = false
+    private var preloadTask: Task<Void, Never>?
+    private var demoTask: Task<String, Error>?
+    private var demoSerial: UInt64 = 0
+    private var pendingAccept: Task<Void, Never>?
+    private let acceptanceDeadline = AcceptanceDeadline()
+    private var recordingSerial: UInt64 = 0
+    private var recordingTasks: [UInt64: Task<Void, Never>] = [:]
     private let history = PersonalizationStore()
     private var pending: Task<Void, Never>?
     private var generationSerial: UInt64 = 0
@@ -150,6 +192,24 @@ final class AppModel: ObservableObject, TextObserver {
 
     init() {
         enabled = defaults.object(forKey: "enabled") as? Bool ?? true
+        let initialMode = defaults.string(forKey: "powerMode").flatMap(PowerMode.init(rawValue:)) ?? .automatic
+        let initialPolicy = PowerPolicy.resolve(mode: initialMode, environment: SystemPowerMonitor.current())
+        powerMode = initialMode
+        powerPolicy = initialPolicy
+        effectivePowerDescription = initialPolicy.description
+        let storedSpeed = defaults.object(forKey: "typingWordsPerMinute") as? Double ?? 40
+        typingWordsPerMinute = storedSpeed.isFinite ? min(200, max(10, storedSpeed)) : 40
+        if let stored = defaults.object(forKey: "savingsStatistics") {
+            do {
+                guard let data = stored as? Data else { throw CocoaError(.coderReadCorrupt) }
+                savings = try JSONDecoder().decode(SavingsStatistics.self, from: data)
+            } catch {
+                savings = SavingsStatistics()
+                savingsError = "Saved statistics could not be read. They have been preserved; reset statistics to start again."
+            }
+        } else {
+            savings = SavingsStatistics()
+        }
         screenContextEnabled = defaults.bool(forKey: "screenContext")
         clipboardContextEnabled = defaults.bool(forKey: "clipboardContext")
         learningEnabled = defaults.bool(forKey: "learning")
@@ -158,8 +218,6 @@ final class AppModel: ObservableObject, TextObserver {
         vocabularyStrength = max(0, min(3, defaults.object(forKey: "vocabularyStrength") as? Int ?? 2))
         maxWords = max(1, min(12, defaults.integer(forKey: "maxWords") == 0 ? 4 : defaults.integer(forKey: "maxWords")))
         trailingSpace = defaults.bool(forKey: "trailingSpace")
-        acceptedWords = defaults.integer(forKey: "acceptedWords")
-        acceptedCompletions = defaults.integer(forKey: "acceptedCompletions")
         accessibilityGranted = monitor.isTrusted
         let oldAppRules = defaults.data(forKey: "appRules").flatMap { try? JSONDecoder().decode([AppRule].self, from: $0) } ?? []
         appRules = oldAppRules.filter {
@@ -183,11 +241,12 @@ final class AppModel: ObservableObject, TextObserver {
         if domainRules != oldDomainRules { saveDomainRules() }
         siteRules = domainRules.map { (domain: $0.id, enabled: $0.enabled, recordWriting: $0.recordWriting) }
         monitor.delegate = self
-        if accessibilityGranted {
-            monitoring = monitor.start()
-            status = monitoring ? "Ready" : "Keyboard interception unavailable"
-            preloadModel()
-        }
+        inference.onStateWillChange = { [weak self] in self?.objectWillChange.send() }
+        inference.configureIdleUnload(after: powerPolicy.idleUnloadDelay)
+        powerMonitor.onChange = { [weak self] environment in self?.applyPowerPolicy(environment) }
+        powerMonitor.start()
+        observeLifecycle()
+        reconcileMonitoring()
     }
 
     var screenGranted: Bool { CGPreflightScreenCaptureAccess() }
@@ -234,45 +293,127 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     func demoComplete(_ text: String) async {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            demoOutput = ""
-            return
-        }
+        clearDemo()
+        guard !terminated, !sleeping, sessionActive,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let serial = demoSerial
+        let wordLimit = maxWords
         demoBusy = true
-        demoOutput = ""
-        defer { demoBusy = false }
+        defer {
+            if demoSerial == serial {
+                demoBusy = false
+                demoTask = nil
+            }
+        }
         let context = PredictionContext(before: text, after: "", appName: "FreeComplete demo",
                                         appID: "app.freecomplete.demo", visibleText: nil, clipboard: nil,
                                         siteDomain: nil)
         let options = PredictionOptions(globalInstructions: globalInstructions, appInstructions: "",
                                         domainInstructions: "", vocabularyStrength: 0,
-                                        vocabulary: "", maxWords: maxWords)
-        do {
-            let raw = try await inference.generate(
+                                        vocabulary: "", maxWords: wordLimit)
+        let request = Task { @MainActor [inference] in
+            try await inference.generate(
                 prompt: PredictionPrompt.make(context: context, options: options, kind: .continuation),
-                maxTokens: maxWords, maxWords: maxWords, kind: .continuation)
-            demoOutput = PredictionPrompt.clean(raw, maxWords: maxWords)
-        } catch {
-            if !(error is CancellationError) { status = "Local model: \(error.localizedDescription)" }
+                maxTokens: wordLimit, maxWords: wordLimit, kind: .continuation)
         }
-        objectWillChange.send()
+        demoTask = request
+        do {
+            let raw = try await withTaskCancellationHandler {
+                try await request.value
+            } onCancel: { request.cancel() }
+            guard demoSerial == serial, !Task.isCancelled else { return }
+            demoOutput = PredictionPrompt.clean(raw, maxWords: wordLimit)
+            if demoOutput.isEmpty { demoError = "No continuation returned. Try a longer sentence." }
+        } catch {
+            guard demoSerial == serial, !Task.isCancelled, !(error is CancellationError) else { return }
+            demoError = error.localizedDescription
+        }
     }
 
-    func clearDemo() { demoOutput = "" }
+    func clearDemo() {
+        demoSerial &+= 1
+        demoTask?.cancel()
+        demoTask = nil
+        demoBusy = false
+        demoOutput = ""
+        demoError = nil
+    }
+
     func checkPermission() {
         let granted = monitor.isTrusted
-        if accessibilityGranted != granted { accessibilityGranted = granted }
-        if granted && !monitoring {
-            monitoring = monitor.start()
-            status = monitoring ? "Ready" : "Keyboard interception unavailable"
-            preloadModel()
-        } else if !granted && monitoring {
-            monitor.stop()
-            monitoring = false
-            status = "Allow Accessibility in System Settings to use autocomplete"
-        } else if !granted && status != "Allow Accessibility in System Settings to use autocomplete" {
-            status = "Allow Accessibility in System Settings to use autocomplete"
+        if accessibilityGranted != granted {
+            accessibilityGranted = granted
+            reconcileMonitoring()
+        } else if granted, enabled, !monitoring, !sleeping, sessionActive, !terminated {
+            reconcileMonitoring()
         }
+    }
+
+    private var operational: Bool {
+        enabled && accessibilityGranted && monitoring && !sleeping && sessionActive && !terminated
+    }
+
+    private func reconcileMonitoring() {
+        let wasMonitoring = monitoring
+        monitoring = false
+        resetTransientState()
+        if wasMonitoring { monitor.stop() }
+        guard !terminated, !sleeping, sessionActive, enabled, accessibilityGranted else {
+            inference.unload()
+            if !enabled { status = "Completions paused" }
+            else if sleeping || !sessionActive { status = "Completions suspended" }
+            else { status = "Allow Accessibility in System Settings to use autocomplete" }
+            return
+        }
+        monitoring = monitor.start()
+        status = monitoring ? "Ready" : "Keyboard interception unavailable"
+        if monitoring { monitor.scheduleRefresh(force: true) }
+        preloadModel()
+    }
+
+    private func observeLifecycle() {
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
+                     NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            lifecycleObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self, !self.terminated else { return }
+                    switch note.name {
+                    case NSWorkspace.willSleepNotification: self.sleeping = true
+                    case NSWorkspace.didWakeNotification: self.sleeping = false
+                    case NSWorkspace.sessionDidResignActiveNotification: self.sessionActive = false
+                    case NSWorkspace.sessionDidBecomeActiveNotification: self.sessionActive = true
+                    default: return
+                    }
+                    self.accessibilityGranted = self.monitor.isTrusted
+                    self.applyPowerPolicy(SystemPowerMonitor.current())
+                    self.reconcileMonitoring()
+                }
+            })
+        }
+    }
+
+    private func applyPowerPolicy(_ environment: PowerEnvironment) {
+        let next = PowerPolicy.resolve(mode: powerMode, environment: environment)
+        guard next != powerPolicy else { return }
+        powerPolicy = next
+        effectivePowerDescription = next.description
+        inference.configureIdleUnload(after: next.idleUnloadDelay)
+        resetTransientState()
+        if operational { monitor.scheduleRefresh(force: true) }
+        preloadModel()
+    }
+
+    private func resetTransientState() {
+        invalidateSuggestion()
+        preloadTask?.cancel()
+        preloadTask = nil
+        clearDemo()
+        screen.clearCache()
+        lastScreenUse = nil
+        snapshot = nil
+        pauseUntil = .distantPast
+        lastApp = "No text field active"
     }
 
     func requestAccessibility() {
@@ -285,18 +426,19 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     func clearLearning() {
+        refreshCurrent()
         history.clear()
         objectWillChange.send()
     }
 
     func stop() {
-        pending?.cancel()
-        pendingGeneration = nil
-        pendingRemainder = nil
-        cancelPrefetch()
-        pendingRecording?.cancel()
+        terminated = true
+        monitoring = false
+        resetTransientState()
         monitor.stop()
-        overlay.hide()
+        powerMonitor.stop()
+        for observer in lifecycleObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        lifecycleObservers.removeAll()
         inference.stop()
     }
 
@@ -359,7 +501,7 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     private func allows(_ snapshot: TextSnapshot) -> Bool {
-        !IsSecureEventInputEnabled() && enabled
+        !IsSecureEventInputEnabled() && operational
             && rule(for: snapshot.appID).enabled
             && sitePolicy(for: snapshot).suggest
     }
@@ -377,9 +519,13 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     private func queueRecording(text: String, for snapshot: TextSnapshot, monitored: Bool) {
-        Task { @MainActor [weak self] in
+        recordingSerial &+= 1
+        let serial = recordingSerial
+        recordingTasks[serial] = Task { @MainActor [weak self] in
+            defer { self?.recordingTasks[serial] = nil }
             await Task.yield()
-            guard let self, (!monitored || self.recordAllWriting), self.permitsRecording(snapshot) else { return }
+            guard let self, !Task.isCancelled, (!monitored || self.recordAllWriting),
+                  self.permitsRecording(snapshot) else { return }
             self.history.recordWriting(text: text, appID: snapshot.appID, domain: snapshot.siteDomain)
             if let error = self.history.lastError { self.status = error }
             self.objectWillChange.send()
@@ -405,7 +551,10 @@ final class AppModel: ObservableObject, TextObserver {
 
     private func refreshCurrent() {
         invalidateSuggestion()
-        monitor.scheduleRefresh(force: true)
+        clearDemo()
+        screen.clearCache()
+        lastScreenUse = nil
+        if operational { monitor.scheduleRefresh(force: true) }
     }
 
     private func beginGeneration() -> UInt64 {
@@ -415,21 +564,41 @@ final class AppModel: ObservableObject, TextObserver {
         return generationSerial
     }
 
+    /// Focus, geometry, privacy and policy changes never retain a hidden suggestion.
     func invalidateSuggestion() {
+        invalidateSuggestion(preservingTypedThrough: false)
+    }
+
+    /// Only an actual text-edit key may carry a visible continuation across its edit.
+    func textWillChange() {
+        invalidateSuggestion(preservingTypedThrough: true)
+    }
+
+    private func invalidateSuggestion(preservingTypedThrough: Bool) {
         pending?.cancel()
+        pending = nil
         pendingGeneration = nil
         pendingRemainder = nil
+        pendingAccept?.cancel()
+        pendingAccept = nil
+        acceptanceDeadline.cancel()
         queuedAccepts.removeAll()
-        // A key may be the next character of the visible suggestion. Keep it (and the
-        // continuation prepared after it) until the field reports what was typed.
-        dropTypeThrough()
-        if let snapshot, !suggestion.isEmpty {
+        cancelRecording()
+        if !preservingTypedThrough || !suggestion.isEmpty { dropTypeThrough() }
+        if preservingTypedThrough, let snapshot, snapshot.selected.isEmpty, !suggestion.isEmpty {
             typeThrough = TypeThrough(source: snapshot, text: suggestion, screen: suggestionScreen, prefetch: prefetch)
             prefetch = nil
         } else {
             cancelPrefetch()
         }
         clearSuggestion()
+    }
+
+    private func cancelRecording() {
+        pendingRecording?.cancel()
+        pendingRecording = nil
+        for task in recordingTasks.values { task.cancel() }
+        recordingTasks.removeAll()
     }
 
     private func dropTypeThrough() {
@@ -445,6 +614,8 @@ final class AppModel: ObservableObject, TextObserver {
         let source = held.source
         let delta = next.range.location - source.range.location
         guard next.pid == source.pid, CFEqual(next.element, source.element), delta > 0,
+              next.after == source.after, next.siteDomain == source.siteDomain,
+              next.siteDomains == source.siteDomains, next.isWebContent == source.isWebContent,
               next.range.length == 0, ineligibility(next) == nil else {
             held.prefetch?.task?.cancel()
             return false
@@ -459,37 +630,62 @@ final class AppModel: ObservableObject, TextObserver {
             held.prefetch?.task?.cancel()
             return false
         }
-        prefetch = held.prefetch
+        prefetch = held.prefetch?.result?.text.isEmpty == true ? nil : held.prefetch
         Trace.log("typed through \(typed.debugDescription), still showing \(rest.debugDescription)")
         showContinuation(rest, for: next, prefetchNext: prefetch == nil, screen: held.screen)
         return true
     }
 
     func textDidChange(_ newSnapshot: TextSnapshot?) {
+        guard operational else {
+            invalidateSuggestion()
+            snapshot = nil
+            return
+        }
+        if let previous = snapshot, let newSnapshot,
+           previous.pid != newSnapshot.pid || !CFEqual(previous.element, newSnapshot.element)
+            || previous.siteDomains != newSnapshot.siteDomains || previous.siteDomain != newSnapshot.siteDomain
+            || previous.isWebContent != newSnapshot.isWebContent
+            || (previous.matchesContent(newSnapshot) && previous.caret != newSnapshot.caret) {
+            invalidateSuggestion()
+            screen.clearCache()
+            lastScreenUse = nil
+        }
+        // Some apps publish the pre-insert value once before the real edit. Do not
+        // abandon a confirmed key's bounded continuation ownership on that repeat.
+        if let newSnapshot, let remainder = pendingRemainder,
+           Date() < remainder.expiresAt, remainder.source.matchesContent(newSnapshot),
+           remainder.source.caret == newSnapshot.caret { return }
+        if let newSnapshot, let next = prefetch, let deadline = next.armedUntil,
+           Date() < deadline, next.source.matchesContent(newSnapshot),
+           next.source.caret == newSnapshot.caret { return }
         // AX notifications and the forced post-insert refresh both report the same edit.
         // A repeat for unchanged text must not clear or restart the visible suggestion.
-        if let newSnapshot, let previous = snapshot, previous.fingerprint == newSnapshot.fingerprint,
+        if let newSnapshot, let previous = snapshot, previous.matchesContent(newSnapshot),
+           previous.caret == newSnapshot.caret,
            !suggestion.isEmpty || pendingGeneration != nil || prefetch?.matches(newSnapshot) == true {
             snapshot = newSnapshot
             return
         }
         pending?.cancel()
         pendingGeneration = nil
-        pendingRecording?.cancel()
+        pendingAccept?.cancel()
+        pendingAccept = nil
+        cancelRecording()
         clearSuggestion()
         let previous = snapshot
         snapshot = newSnapshot
         guard let newSnapshot else {
-            pendingRemainder = nil
-            cancelPrefetch()
-            dropTypeThrough()
-            if let previous { recordMonitored(previous) }
+            invalidateSuggestion()
+            screen.clearCache()
+            lastScreenUse = nil
             lastApp = "No text field active"
             if IsSecureEventInputEnabled() { status = "Secure Input active; completions paused" }
             return
         }
         if let remainder = pendingRemainder {
             pendingRemainder = nil
+            scheduleAcceptanceDeadline()
             if remainder.matches(newSnapshot), allows(newSnapshot) {
                 showContinuation(remainder.text, for: newSnapshot, prefetchNext: false, screen: remainder.screen)
                 return
@@ -505,22 +701,28 @@ final class AppModel: ObservableObject, TextObserver {
         observedDomains.formUnion(newSnapshot.siteDomains)
         if recordAllWriting, permitsRecording(newSnapshot), newSnapshot.selected.isEmpty,
            newSnapshot.before.utf16.count >= 40 {
-            let marker = newSnapshot.fingerprint
             pendingRecording = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(1_200))
-                guard let self, !Task.isCancelled, self.snapshot?.fingerprint == marker else { return }
+                guard let self, !Task.isCancelled, self.snapshot?.matchesContent(newSnapshot) == true else { return }
                 self.recordMonitored(newSnapshot)
             }
         }
-        // The user accepted the whole suggestion: the next one was generated while they read it.
-        if let prefetch, prefetch.matches(newSnapshot) {
-            if let result = prefetch.result, eligible(newSnapshot) {
+        // Performance may already have this result. Saver starts it only after the
+        // accepted insertion is observed, retaining bounded ownership of rapid Tabs.
+        if let prefetch, prefetch.matches(newSnapshot), eligible(newSnapshot) {
+            if let deadline = prefetch.armedUntil, Date() >= deadline { queuedAccepts.removeAll() }
+            if let result = prefetch.result {
                 self.prefetch = nil
                 if !result.text.isEmpty {
                     showContinuation(result.text, for: newSnapshot, prefetchNext: true, screen: result.screen)
+                    return
                 }
+            } else {
+                if prefetch.task == nil {
+                    generateNextContinuation(prefetch, for: newSnapshot, before: newSnapshot.before)
+                }
+                return
             }
-            return
         }
         cancelPrefetch()
         queuedAccepts.removeAll()
@@ -528,19 +730,19 @@ final class AppModel: ObservableObject, TextObserver {
             Trace.log("skip: \(reason)")
             return
         }
-        let marker = newSnapshot.fingerprint
+        let debounce = powerPolicy.debounce
         let generation = beginGeneration()
         pending = Task { @MainActor [weak self] in
             defer { if self?.pendingGeneration == generation { self?.pendingGeneration = nil } }
             // A brief pause so a burst of keys does not start a search per keystroke; a
             // newer key cancels this one between search rounds anyway.
-            try? await Task.sleep(for: .milliseconds(30))
+            try? await Task.sleep(for: debounce)
             guard let self, !Task.isCancelled, self.allows(newSnapshot) else { return }
             let started = Date()
             do {
                 let result = try await self.continuation(for: newSnapshot, before: newSnapshot.before)
                 let ms = Int(Date().timeIntervalSince(started) * 1000)
-                guard !Task.isCancelled, self.snapshot?.fingerprint == marker, self.allows(newSnapshot) else {
+                guard !Task.isCancelled, self.snapshot?.matchesContent(newSnapshot) == true, self.allows(newSnapshot) else {
                     Trace.log("generated \(ms) ms but text changed meanwhile")
                     return
                 }
@@ -565,6 +767,7 @@ final class AppModel: ObservableObject, TextObserver {
     /// Why no suggestion is generated for this field state, or nil when one should be.
     private func ineligibility(_ snapshot: TextSnapshot) -> String? {
         if !enabled { return "completions paused" }
+        if !operational { return "autocomplete unavailable" }
         if !rule(for: snapshot.appID).enabled { return "app \(snapshot.appID) is off" }
         if IsSecureEventInputEnabled() { return "secure input" }
         if !sitePolicy(for: snapshot).suggest { return "website excluded or unknown" }
@@ -586,7 +789,7 @@ final class AppModel: ObservableObject, TextObserver {
         // recording is off is not captured at all.
         let captured = screenContextEnabled && rule(for: snapshot.appID).recordWriting
             && !domainRules.contains(where: { !$0.enabled || !$0.recordWriting })
-            ? screen.transcript(pid: snapshot.pid, caret: snapshot.caret,
+            ? screen.transcript(pid: snapshot.pid, element: snapshot.element, caret: snapshot.caret,
                                 field: monitor.inlineMetrics(for: snapshot).fieldFrame) : nil
         let screenUse = captured.map { ScreenUse(app: snapshot.appName, capturedAt: $0.capturedAt, text: $0.text) }
         try Task.checkCancellation()
@@ -610,6 +813,7 @@ final class AppModel: ObservableObject, TextObserver {
     /// grave accept exactly what is visible. Then, while the user reads it, generate
     /// what follows the whole suggestion so accepting it continues without a wait.
     private func showContinuation(_ text: String, for snapshot: TextSnapshot, prefetchNext: Bool, screen: ScreenUse?) {
+        guard allows(snapshot), self.snapshot?.matchesContent(snapshot) == true else { return }
         let metrics = monitor.inlineMetrics(for: snapshot)
         let shown = overlay.showInline(text, at: snapshot.caret, metrics: metrics)
         guard !shown.isEmpty else {
@@ -623,35 +827,63 @@ final class AppModel: ObservableObject, TextObserver {
         suggestionScreen = screen
         if let screen { lastScreenUse = screen }
         if prefetchNext { startPrefetch(after: shown, from: snapshot) }
+        scheduleAcceptanceDeadline()
         // Tabs pressed before this suggestion appeared are applied now, in order.
         if !queuedAccepts.isEmpty {
             let full = queuedAccepts.removeFirst()
-            Task { @MainActor [weak self] in _ = self?.acceptSuggestion(full: full) }
+            pendingAccept?.cancel()
+            pendingAccept = Task { @MainActor [weak self] in
+                guard let self, !Task.isCancelled, self.snapshot?.matchesContent(snapshot) == true,
+                      self.suggestion == shown, self.allows(snapshot) else { return }
+                self.pendingAccept = nil
+                _ = self.acceptSuggestion(full: full)
+            }
         }
     }
 
     private func startPrefetch(after shown: String, from snapshot: TextSnapshot) {
         cancelPrefetch()
+        guard powerPolicy.prefetchesContinuation, allows(snapshot) else { return }
         let full = snapshot.before + shown
         let expected = String(decoding: full.utf16.suffix(1_200), as: UTF16.self)
-        var next = Prefetch(source: snapshot, expectedBefore: expected)
-        next.task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let result = (try? await self.continuation(for: snapshot, before: full)) ?? Continuation(text: "", screen: nil)
-            guard !Task.isCancelled, self.prefetch?.expectedBefore == expected else { return }
-            self.prefetch?.result = result
-            self.prefetch?.task = nil
-            if result.text.isEmpty { self.queuedAccepts.removeAll() }
-            // Accepted before the prefetch finished: show it the moment it is ready.
-            if let current = self.snapshot, self.prefetch?.matches(current) == true,
+        let next = Prefetch(source: snapshot, expectedBefore: expected)
+        prefetch = next
+        generateNextContinuation(next, for: snapshot, before: full)
+    }
+
+    private func generateNextContinuation(_ next: Prefetch, for snapshot: TextSnapshot, before: String) {
+        next.task = Task { @MainActor [weak self, weak next] in
+            guard let self, let next else { return }
+            let result: Continuation
+            var failure: Error?
+            do {
+                result = try await self.continuation(for: snapshot, before: before)
+            } catch {
+                guard !Task.isCancelled, !(error is CancellationError) else { return }
+                failure = error
+                result = Continuation(text: "", screen: nil)
+            }
+            guard !Task.isCancelled, self.allows(snapshot),
+                  self.prefetch === next || self.typeThrough?.prefetch === next else { return }
+            if let failure, next.armedUntil != nil || self.snapshot.map(next.matches) == true {
+                self.status = "Local model: \(failure.localizedDescription)"
+            }
+            next.result = result
+            next.task = nil
+            if let deadline = next.armedUntil, Date() >= deadline { self.queuedAccepts.removeAll() }
+            if result.text.isEmpty {
+                if self.prefetch === next { self.prefetch = nil }
+                self.queuedAccepts.removeAll()
+                self.scheduleAcceptanceDeadline()
+                return
+            }
+            // Keep the result on its identity even while a text-edit key holds it.
+            if self.prefetch === next, let current = self.snapshot, next.matches(current),
                self.suggestion.isEmpty, self.pendingRemainder == nil, self.eligible(current) {
                 self.prefetch = nil
-                if !result.text.isEmpty {
-                    self.showContinuation(result.text, for: current, prefetchNext: true, screen: result.screen)
-                }
+                self.showContinuation(result.text, for: current, prefetchNext: true, screen: result.screen)
             }
         }
-        prefetch = next
     }
 
     private func cancelPrefetch() {
@@ -660,13 +892,16 @@ final class AppModel: ObservableObject, TextObserver {
     }
 
     func acceptSuggestion(full: Bool) -> Bool {
+        guard operational else { return false }
         if !alternativeChoices.isEmpty { return selectAlternative(0) }
         // The next part is still on its way (the field has not reported the last insert,
         // or the continuation is still generating). Keep the key instead of letting it
         // type a literal tab; it is applied as soon as the text appears.
         if pendingRemainder != nil || awaitingPrefetch() {
+            guard hasAcceptableSuggestion() else { invalidateSuggestion(); return false }
             guard queuedAccepts.count < 8 else { return true }
             queuedAccepts.append(full)
+            scheduleAcceptanceDeadline()
             return true
         }
         guard let snapshot, !suggestion.isEmpty, allows(snapshot) else { return false }
@@ -675,10 +910,9 @@ final class AppModel: ObservableObject, TextObserver {
         let remainder = !full && suggestion.hasPrefix(accepted)
             ? String(suggestion.dropFirst(accepted.count)) : ""
         guard !accepted.isEmpty, monitor.insert(accepted, matching: snapshot) else {
-            clearSuggestion()
+            invalidateSuggestion()
             return false
         }
-        recordAcceptance(accepted)
         if permitsRecording(snapshot), snapshot.before.utf16.count >= 40 {
             queueRecording(text: String(snapshot.before.suffix(120)) + String(accepted.prefix(80)),
                            for: snapshot, monitored: false)
@@ -696,25 +930,66 @@ final class AppModel: ObservableObject, TextObserver {
                 expiresAt: Date().addingTimeInterval(2),
                 screen: usedScreen
             )
-        } else {
+        } else if snapshot.selected.isEmpty {
+            let expected = String(decoding: (snapshot.before + accepted).utf16.suffix(1_200), as: UTF16.self)
+            if prefetch?.expectedBefore != expected {
+                cancelPrefetch()
+                // No generation until textDidChange confirms the accepted insertion.
+                prefetch = Prefetch(source: snapshot, expectedBefore: expected)
+            }
             prefetch?.armedUntil = Date().addingTimeInterval(1.5)
         }
+        scheduleAcceptanceDeadline()
         return true
     }
 
     func dismissSuggestion() -> Bool {
         guard !suggestion.isEmpty || !alternativeChoices.isEmpty || pendingRemainder != nil
-                || pendingGeneration != nil else { return false }
+                || pendingGeneration != nil || awaitingPrefetch() || !queuedAccepts.isEmpty else { return false }
         invalidateSuggestion()
         cancelPrefetch()
         pauseUntil = Date().addingTimeInterval(2.5)
         return true
     }
 
-    /// Load the model before the first keystroke, so typing never waits ~20 s for it.
+    private func scheduleAcceptanceDeadline() {
+        acceptanceDeadline.cancel()
+        guard let deadline = [pendingRemainder?.expiresAt, prefetch?.armedUntil].compactMap({ $0 }).min() else { return }
+        acceptanceDeadline.schedule(at: deadline) { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            var expired = false
+            if let remainder = self.pendingRemainder, now >= remainder.expiresAt {
+                self.pendingRemainder = nil
+                expired = true
+            }
+            if let next = self.prefetch, let until = next.armedUntil, now >= until {
+                next.armedUntil = nil
+                // A confirmed on-demand generation may still finish, but no longer
+                // owns Tab. An unconfirmed insertion cannot start future work.
+                if next.task == nil, next.result == nil { self.cancelPrefetch() }
+                expired = true
+            }
+            if expired {
+                self.pendingAccept?.cancel()
+                self.pendingAccept = nil
+                if !self.queuedAccepts.isEmpty {
+                    self.status = "Continuation timed out; press Tab again when a suggestion appears"
+                }
+                self.queuedAccepts.removeAll()
+            }
+            self.scheduleAcceptanceDeadline()
+        }
+    }
+
+    /// Performance can load ahead of typing; Battery Saver only loads on a request.
     private func preloadModel() {
-        guard enabled, monitoring else { return }
-        Task { @MainActor [weak self] in await self?.inference.prepare() }
+        guard operational, powerPolicy.preloadsModel, preloadTask == nil else { return }
+        preloadTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            await self.inference.prepare()
+            if !Task.isCancelled { self.preloadTask = nil }
+        }
     }
 
     func hasAcceptableSuggestion() -> Bool {
@@ -738,8 +1013,7 @@ final class AppModel: ObservableObject, TextObserver {
 
     func requestAlternatives() -> Bool {
         guard let snapshot, allows(snapshot), snapshot.selected.isEmpty else { return false }
-        pendingRemainder = nil
-        let marker = snapshot.fingerprint
+        invalidateSuggestion()
         let generation = beginGeneration()
         pending = Task { @MainActor [weak self] in
             defer { if self?.pendingGeneration == generation { self?.pendingGeneration = nil } }
@@ -750,7 +1024,7 @@ final class AppModel: ObservableObject, TextObserver {
                 let raw = try await self.inference.generate(
                     prompt: PredictionPrompt.make(context: context, options: options, kind: .alternatives),
                     maxTokens: 44, maxWords: 1, kind: .alternatives)
-                guard !Task.isCancelled, self.snapshot?.fingerprint == marker,
+                guard !Task.isCancelled, self.snapshot?.matchesContent(snapshot) == true,
                       self.allows(snapshot) else { return }
                 self.alternativeChoices = Array(raw.split(whereSeparator: \.isNewline).compactMap { line -> String? in
                     guard let insertion = PredictionPrompt.alternative(String(line)) else {
@@ -779,18 +1053,36 @@ final class AppModel: ObservableObject, TextObserver {
     func selectAlternative(_ index: Int) -> Bool {
         guard alternativeChoices.indices.contains(index), let snapshot, allows(snapshot),
               monitor.insert(alternativeChoices[index], matching: snapshot) else { return false }
-        recordAcceptance(alternativeChoices[index])
         pending?.cancel()
         pendingGeneration = nil
         clearSuggestion()
         return true
     }
 
-    private func recordAcceptance(_ text: String) {
-        acceptedCompletions += 1
-        acceptedWords += text.split(whereSeparator: \.isWhitespace).count
-        defaults.set(acceptedCompletions, forKey: "acceptedCompletions")
-        defaults.set(acceptedWords, forKey: "acceptedWords")
+    /// The monitor calls this only after the native field confirms the inserted text.
+    func insertionConfirmed(text: String, replacingSelection: Bool) {
+        guard savingsError == nil else { return }
+        do {
+            try savings.record(inserted: text, replacingSelection: replacingSelection, at: Date())
+            persistSavings()
+        } catch {
+            savingsError = "Statistics could not be updated: \(error.localizedDescription) Existing totals have been preserved; reset statistics to start again."
+        }
+    }
+
+    func resetSavings() {
+        savings = SavingsStatistics(timeZone: .current)
+        savingsError = nil
+        persistSavings()
+    }
+
+    private func persistSavings() {
+        do {
+            let data = try JSONEncoder().encode(savings)
+            defaults.set(data, forKey: "savingsStatistics")
+        } catch {
+            savingsError = "Statistics could not be saved: \(error.localizedDescription) Previously saved totals have been preserved; reset statistics to start again."
+        }
     }
 
     func requestRewrite(correction: Bool) -> Bool {
@@ -799,8 +1091,7 @@ final class AppModel: ObservableObject, TextObserver {
             status = "Select one word for a synonym"
             return false
         }
-        clearSuggestion()
-        let marker = snapshot.fingerprint
+        invalidateSuggestion()
         let generation = beginGeneration()
         pending = Task { @MainActor [weak self] in
             defer { if self?.pendingGeneration == generation { self?.pendingGeneration = nil } }
@@ -813,7 +1104,7 @@ final class AppModel: ObservableObject, TextObserver {
                                                   kind: correction ? .correction(snapshot.selected) : .synonym(snapshot.selected)),
                     maxWords: 20,
                     kind: correction ? .correction(snapshot.selected) : .synonym(snapshot.selected))
-                guard !Task.isCancelled, self.snapshot?.fingerprint == marker,
+                guard !Task.isCancelled, self.snapshot?.matchesContent(snapshot) == true,
                       self.allows(snapshot) else { return }
                 guard let replacement = PredictionPrompt.replacement(raw, selected: snapshot.selected) else {
                     self.status = "No replacement change available"

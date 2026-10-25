@@ -2,7 +2,8 @@ import Foundation
 
 /// Local diagnostics: one line per decision (field read, eligibility, generation,
 /// display, acceptance) in ~/Library/Logs/FreeComplete/trace.log. Off unless the
-/// `diagnostics` default is set. Lines carry at most the last 16 characters typed.
+/// `diagnostics` default is set. Typed-context tails are shortened, but generated
+/// suggestions and accepted text can appear in full. This is not aggregate-only data.
 @MainActor
 enum Trace {
     static let url = FileManager.default.homeDirectoryForCurrentUser
@@ -25,8 +26,10 @@ enum Trace {
                 try? FileManager.default.removeItem(at: url)
             }
             if !FileManager.default.fileExists(atPath: url.path) {
-                FileManager.default.createFile(atPath: url.path, contents: nil)
+                FileManager.default.createFile(atPath: url.path, contents: nil,
+                                               attributes: [.posixPermissions: 0o600])
             }
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             handle = try? FileHandle(forWritingTo: url)
             _ = try? handle?.seekToEnd()
         }

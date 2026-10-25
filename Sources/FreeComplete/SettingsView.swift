@@ -6,6 +6,9 @@ struct SettingsView: View {
     @State private var draft = "The next step for this project is"
     @State private var selection = 0
     @State private var domainDraft = ""
+    @State private var savingsPeriod: SavingsStatistics.Period = .today
+    @State private var confirmSavingsReset = false
+    @State private var demoSourceDraft: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -37,13 +40,31 @@ struct SettingsView: View {
             .padding(.bottom, 12)
         }
         .frame(minWidth: 680, minHeight: 540)
+        .onChange(of: draft) { _, _ in
+            demoSourceDraft = nil
+            model.clearDemo()
+        }
+        .onDisappear {
+            demoSourceDraft = nil
+            model.clearDemo()
+        }
+        .alert("Reset savings statistics?", isPresented: $confirmSavingsReset) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset statistics", role: .destructive) { model.resetSavings() }
+        } message: {
+            Text("This permanently clears all daily and lifetime savings counts on this Mac. Writing history, settings, and legacy counters are unchanged.")
+        }
     }
 
     private var dashboard: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                GroupBox("Ready to write") {
+                GroupBox(model.enabled ? "Ready to write" : "Completions paused") {
                     VStack(alignment: .leading, spacing: 12) {
+                        if !model.enabled {
+                            Text("Cross-app suggestions are paused. Turn on Completions above to resume; the local test still works.")
+                                .foregroundStyle(.secondary)
+                        }
                         HStack {
                             statusSymbol(model.accessibilityGranted)
                             VStack(alignment: .leading, spacing: 3) {
@@ -67,11 +88,14 @@ struct SettingsView: View {
                         Text("If Ice hides the FC item, reopen this window from the Dock.")
                             .font(.caption).foregroundStyle(.secondary)
                         if model.status != "Ready" {
-                            Text(model.status).font(.caption).foregroundStyle(.orange)
+                            Text(model.status).font(.caption).foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                         }
                     }.padding(8)
                 }
+
+                powerControls
+                savingsSummary
 
                 if model.screenContextEnabled {
                     GroupBox("Screen context") {
@@ -119,20 +143,32 @@ struct SettingsView: View {
                             .accessibilityLabel("Local model test editor")
                         HStack {
                             Button(model.demoBusy ? "Generating…" : "Suggest continuation") {
-                                Task { await model.demoComplete(draft) }
+                                let source = draft
+                                demoSourceDraft = source
+                                Task {
+                                    guard draft == source, demoSourceDraft == source else { return }
+                                    await model.demoComplete(source)
+                                }
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(model.demoBusy || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            if !model.demoOutput.isEmpty {
+                            if !model.demoOutput.isEmpty, demoSourceDraft == draft, !model.demoBusy {
                                 Button("Insert suggestion") {
-                                    draft += model.demoOutput
-                                    model.clearDemo()
+                                    guard demoSourceDraft == draft, !model.demoBusy else { return }
+                                    let insertion = model.demoOutput
+                                    demoSourceDraft = nil
+                                    draft += insertion
                                 }
                             }
                             Spacer()
                             if model.demoBusy { ProgressView().controlSize(.small) }
                         }
-                        if !model.demoOutput.isEmpty {
+                        if let error = model.demoError {
+                            Text(error)
+                                .font(.callout).foregroundStyle(.red)
+                                .textSelection(.enabled)
+                        }
+                        if !model.demoOutput.isEmpty, demoSourceDraft == draft {
                             Text(model.demoOutput)
                                 .font(.system(size: 15))
                                 .foregroundStyle(.teal)
@@ -149,6 +185,79 @@ struct SettingsView: View {
             }
             .padding(.vertical, 16)
         }
+    }
+
+    private var powerControls: some View {
+        GroupBox("Power") {
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("Power mode", selection: $model.powerMode) {
+                    Text("Automatic").tag(PowerMode.automatic)
+                    Text("Performance").tag(PowerMode.performance)
+                    Text("Battery Saver").tag(PowerMode.batterySaver)
+                }
+                .pickerStyle(.segmented)
+                Text(model.effectivePowerDescription)
+                    .font(.callout.weight(.medium))
+                Text("Automatic follows battery power and macOS Low Power Mode. Battery Saver waits longer between suggestions, skips background lookahead, and unloads the idle model; the next suggestion may take longer. Performance responds sooner. All modes use the same model and writing quality settings.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(8)
+        }
+    }
+
+    private var savingsSummary: some View {
+        GroupBox("Typing savings") {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("Statistics period", selection: $savingsPeriod) {
+                    ForEach(SavingsStatistics.Period.allCases) { period in
+                        Text(period.title).tag(period)
+                    }
+                }
+                .pickerStyle(.segmented)
+                if let error = model.savingsError {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                } else {
+                    TimelineView(.periodic(from: Date(timeIntervalSince1970: 0), by: 60)) { context in
+                        let totals = model.savings.snapshot(period: savingsPeriod, now: context.date)
+                        VStack(alignment: .leading, spacing: 8) {
+                            LabeledContent("Characters inserted", value: totals.insertedCharacters.formatted())
+                            LabeledContent("Completions accepted", value: totals.acceptedCompletions.formatted())
+                            LabeledContent("Estimated typing time", value: Self.typingTime(totals.estimatedSeconds(wordsPerMinute: model.typingWordsPerMinute)))
+                            Divider()
+                            LabeledContent("Rewrites accepted", value: totals.acceptedRewrites.formatted())
+                            LabeledContent("Replacement characters", value: totals.rewrittenCharacters.formatted())
+                            if totals.acceptedCompletions == 0 && totals.acceptedRewrites == 0 {
+                                Text("No confirmed insertions in this period. Counts begin when the destination app reports the inserted text.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .monospacedDigit()
+                    }
+                }
+                Stepper("Typing speed: \(model.typingWordsPerMinute.formatted(.number.precision(.fractionLength(0)))) words/min",
+                        value: $model.typingWordsPerMinute, in: 10...200, step: 5)
+                Text("Estimate = inserted characters ÷ 5 ÷ typing speed. It is not measured time saved: reading and decision time are not deducted, and rewrites are excluded.")
+                    .font(.caption).foregroundStyle(.secondary)
+                DisclosureGroup("What is counted and stored") {
+                    Text("Each confirmed cross-app acceptance counts once, including partial words. Counts are a lower bound: missing text readback or an intervening edit can leave an insertion uncounted. Characters include spaces and Unicode characters, not keystrokes or exact words. Rewrites replace selected text and are counted separately. The local test, rejected suggestions, and failed insertions do not count. Savings statistics store only daily totals, never text. Days use the Gregorian calendar in \(model.savings.timeZoneIdentifier), fixed when tracking starts; Last 7 Days includes today and the six preceding days. All daily totals are kept until you reset them. Reset starts tracking in the current time zone. Older word counters remain stored but are not included.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                }
+                HStack {
+                    Spacer()
+                    Button("Reset statistics…") { confirmSavingsReset = true }
+                }
+            }.padding(8)
+        }
+    }
+
+    private static func typingTime(_ seconds: Double) -> String {
+        if seconds == 0 { return "0 sec" }
+        if seconds < 1 { return "Less than 1 sec" }
+        if seconds < 60 { return "\(Int(seconds.rounded(.down))) sec" }
+        if seconds < 3600 { return "\(Int((seconds / 60).rounded(.down))) min" }
+        return "\((seconds / 3600).formatted(.number.precision(.fractionLength(1)))) hr"
     }
 
     private static func age(_ date: Date, now: Date) -> String {
@@ -291,7 +400,7 @@ struct SettingsView: View {
                         }
                     }.padding(8)
                 }
-                Text("All inference runs in the bundled local server. The app does not require Ollama, an account, or a cloud API. Secure text fields and concealed clipboard items are excluded.")
+                Text("All inference runs inside FreeComplete on this Mac. The app does not require Ollama, an account, or a cloud API. Secure text fields and concealed clipboard items are excluded.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.vertical, 16)
         }

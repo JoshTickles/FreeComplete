@@ -35,10 +35,23 @@ final class SuggestionOverlay {
         panel.orderOut(nil)
         let lineHeight = caret.height
         guard lineHeight > 2, let primaryScreen = NSScreen.screens.first else { inlinePanel.orderOut(nil); return "" }
+        guard caret.minX.isFinite, caret.minY.isFinite, caret.maxX.isFinite,
+              caret.maxY.isFinite else { inlinePanel.orderOut(nil); return "" }
         let font = Self.font(for: metrics, lineHeight: lineHeight)
         let base = metrics.color.flatMap { NSColor(cgColor: $0) } ?? .labelColor
         let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: base.withAlphaComponent(0.45)]
-        let fieldRight = metrics.fieldFrame.map { $0.maxX - 4 }
+        let caretPoint = CGPoint(x: caret.midX, y: primaryScreen.frame.maxY - caret.midY)
+        guard let display = NSScreen.screens.first(where: { $0.frame.contains(caretPoint) }) else {
+            inlinePanel.orderOut(nil)
+            return ""
+        }
+        let visible = display.visibleFrame
+        let screenBounds = CGRect(x: visible.minX, y: primaryScreen.frame.maxY - visible.maxY,
+                                  width: visible.width, height: visible.height)
+        let drawable = metrics.fieldFrame.map { $0.intersection(screenBounds) } ?? screenBounds
+        guard !drawable.isNull, caret.minX >= drawable.minX, caret.minY >= drawable.minY,
+              caret.maxY <= drawable.maxY else { inlinePanel.orderOut(nil); return "" }
+        let fieldRight: CGFloat? = drawable.maxX - 4
         func width(_ text: String) -> CGFloat { ceil((text as NSString).size(withAttributes: attributes).width) }
         func fit(_ available: CGFloat?, trimLeading: Bool) -> String {
             var shown = ""
@@ -62,6 +75,12 @@ final class SuggestionOverlay {
             shown = fit(fieldRight - lineStart, trimLeading: true)
             drawn = String(shown.drop(while: \.isWhitespace))
             origin = CGPoint(x: lineStart, y: caret.maxY)
+        }
+        // A wrapped line must still lie inside the actual field and display.
+        // Single-line fields must not paint a completion over adjacent controls.
+        guard origin.y + lineHeight <= drawable.maxY, origin.x >= drawable.minX else {
+            inlinePanel.orderOut(nil)
+            return ""
         }
         guard !drawn.isEmpty else { inlinePanel.orderOut(nil); return "" }
         ghost.text = NSAttributedString(string: drawn, attributes: attributes)

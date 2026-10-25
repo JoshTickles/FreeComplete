@@ -3,13 +3,14 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class FreeCompleteApp: NSObject, NSApplicationDelegate {
+final class FreeCompleteApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = AppModel()
     private var statusItem: NSStatusItem!
     private var window: NSWindow!
     private var permissionTimer: Timer?
     private var screenIndicator: AnyCancellable?
     private var acceptCounter: AnyCancellable?
+    private var completionState: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -30,6 +31,9 @@ final class FreeCompleteApp: NSObject, NSApplicationDelegate {
         let toggle = NSMenuItem(title: "Pause or resume completions", action: #selector(toggleCompletions), keyEquivalent: "p")
         toggle.target = self
         menu.addItem(toggle)
+        completionState = model.$enabled.removeDuplicates().sink { enabled in
+            toggle.title = enabled ? "Pause completions" : "Resume completions"
+        }
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit FreeComplete", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
@@ -43,16 +47,22 @@ final class FreeCompleteApp: NSObject, NSApplicationDelegate {
             button.toolTip = usesScreen ? "FreeComplete: this suggestion uses screen text"
                 : "FreeComplete: local writing assistance"
         }
-        // "FC 42": accepted completions so far; the menu also shows the word total.
-        acceptCounter = model.$acceptedCompletions.combineLatest(model.$acceptedWords)
-            .sink { [weak self] completions, words in
-                self?.statusItem.button?.title = "FC \(completions.formatted())"
-                tally.title = "\(completions.formatted()) completions accepted · \(words.formatted()) words"
+        // Only confirmed insertions are counted; selection rewrites stay separate.
+        acceptCounter = model.$savings.combineLatest(model.$savingsError).sink { [weak self] savings, error in
+            guard error == nil else {
+                self?.statusItem.button?.title = "FC"
+                tally.title = "Statistics unavailable — open FreeComplete"
+                return
             }
+            let totals = savings.snapshot(period: .allTime)
+            self?.statusItem.button?.title = "FC \(totals.acceptedCompletions.formatted())"
+            tally.title = "\(totals.acceptedCompletions.formatted()) completions · \(totals.insertedCharacters.formatted()) characters · \(totals.acceptedRewrites.formatted()) rewrites"
+        }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 660),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "FreeComplete"
+        window.delegate = self
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
         window.collectionBehavior.insert(.moveToActiveSpace)
@@ -106,6 +116,10 @@ final class FreeCompleteApp: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         openSettings()
         return true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        model.clearDemo()
     }
 
     @objc private func toggleCompletions() { model.enabled.toggle() }

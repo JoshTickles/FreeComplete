@@ -23,7 +23,10 @@ private enum InferenceError: LocalizedError {
 /// helper process, no HTTP. Every model call runs on one serial queue, one search round
 /// at a time, so a newer request waits at most one round and stale work stops early.
 @MainActor final class LocalInference {
-    private(set) var state = "Stopped"
+    var onStateWillChange: (() -> Void)?
+    private(set) var state = "Unloaded" {
+        willSet { if newValue != state { onStateWillChange?() } }
+    }
     nonisolated static let contextSize = Int(LlamaEngine.contextSize)
 
     private nonisolated static let queue = DispatchQueue(label: "app.freecomplete.llama", qos: .userInteractive)
@@ -52,23 +55,75 @@ private enum InferenceError: LocalizedError {
     private var modelTask: Task<LlamaEngine, Error>?
     private var consecutiveFailures = 0
     private var nextAttempt = Date.distantPast
+    private(set) var activeRequests = 0
+    private var idleUnloadDelay: Duration?
+    private var idleUnloadTask: Task<Void, Never>?
+
+    func configureIdleUnload(after delay: Duration?) {
+        idleUnloadDelay = delay
+        scheduleIdleUnload()
+    }
+
+    private func beginRequest() -> ModelSession {
+        idleUnloadTask?.cancel()
+        idleUnloadTask = nil
+        activeRequests += 1
+        return session
+    }
+
+    private func endRequest(in session: ModelSession) {
+        // Retired requests must not decrement a new session's activity count.
+        guard self.session === session else { return }
+        activeRequests -= 1
+        scheduleIdleUnload()
+    }
+
+    private func scheduleIdleUnload() {
+        idleUnloadTask?.cancel()
+        idleUnloadTask = nil
+        guard activeRequests == 0, modelTask != nil, let idleUnloadDelay else { return }
+        let idleSession = session
+        idleUnloadTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: idleUnloadDelay) } catch { return }
+            guard let self, !Task.isCancelled, self.session === idleSession,
+                  self.activeRequests == 0 else { return }
+            self.unload()
+        }
+    }
 
     /// Loads the model ahead of the first request.
     func prepare() async {
+        let requestSession = beginRequest()
+        defer { endRequest(in: requestSession) }
         _ = try? await ready()
     }
 
+    /// Idle and lifecycle release never wait for native work on the UI actor.
+    /// Swapping identity first isolates requests that arrive while teardown is queued.
+    func unload() {
+        let stoppedSession = retireSession()
+        Self.queue.async { stoppedSession.stop() }
+    }
+
+    /// Only final process termination drains the queue synchronously.
     func stop() {
+        let stoppedSession = retireSession()
+        Self.queue.sync { stoppedSession.stop() }
+        state = "Stopped"
+    }
+
+    private func retireSession() -> ModelSession {
         let stoppedSession = session
         session = ModelSession()
         modelTask?.cancel()
         modelTask = nil
-        // Termination cannot leave teardown queued behind process exit. Drain native
-        // work and close resources before returning, including a just-finished load.
-        Self.queue.sync { stoppedSession.stop() }
-        state = "Stopped"
+        idleUnloadTask?.cancel()
+        idleUnloadTask = nil
+        activeRequests = 0
+        state = "Unloaded"
         consecutiveFailures = 0
         nextAttempt = .distantPast
+        return stoppedSession
     }
 
     private func ready() async throws -> LlamaEngine {
@@ -92,9 +147,9 @@ private enum InferenceError: LocalizedError {
         do {
             let loaded = try await pending.value
             guard self.session === session else { throw CancellationError() }
-            try Task.checkCancellation()
             state = "Ready"
             consecutiveFailures = 0
+            try Task.checkCancellation()
             return loaded
         } catch {
             guard self.session === session else { throw CancellationError() }
@@ -129,6 +184,8 @@ private enum InferenceError: LocalizedError {
         if let maxTokens, maxTokens <= 0 { throw InferenceError.invalidTokenCount }
         guard maxWords > 0 else { throw InferenceError.invalidWordCount }
         try Task.checkCancellation()
+        let requestSession = beginRequest()
+        defer { endRequest(in: requestSession) }
         let session = self.session
         let engine = try await ready()
         let prompt: String

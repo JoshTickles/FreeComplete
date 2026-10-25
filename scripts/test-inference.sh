@@ -17,7 +17,7 @@ swiftc -parse-as-library -O -swift-version 5 -D DEBUG \
     "$ROOT/Sources/FreeComplete/PredictionLogic.swift" \
     "$ROOT/Sources/FreeComplete/Trace.swift" \
     "$ROOT/Tests/InferenceLifecycle/main.swift" -o "$OUTPUT"
-for scenario in stop restart cancel; do
+for scenario in stop restart cancel cancel-preload unload-loading idle; do
     FREECOMPLETE_MODEL="$MODEL" "$OUTPUT" "$scenario"
 done
 echo 'Native inference lifecycle checks passed (including clean process exits)'

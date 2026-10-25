@@ -17,6 +17,30 @@ struct TextSnapshot {
     let caret: CGRect
 
     var fingerprint: String { "\(pid):\(siteDomains):\(siteDomain ?? ""):\(isWebContent):\(range.location):\(range.length):\(before):\(selected):\(after)" }
+
+    func matchesContent(_ other: TextSnapshot) -> Bool {
+        pid == other.pid && appID == other.appID && CFEqual(element, other.element)
+            && fingerprint == other.fingerprint
+    }
+}
+
+/// An insertion is counted only after the field reports its expected text and caret.
+struct InsertionReceipt {
+    let source: TextSnapshot
+    let text: String
+    let expiresAt: Date
+
+    func matches(_ current: TextSnapshot, now: Date = Date()) -> Bool {
+        guard now <= expiresAt, source.pid == current.pid,
+              source.appID == current.appID, CFEqual(source.element, current.element),
+              source.siteDomains == current.siteDomains, source.siteDomain == current.siteDomain,
+              source.isWebContent == current.isWebContent,
+              current.range.length == 0,
+              current.range.location == source.range.location + text.utf16.count,
+              current.after == source.after else { return false }
+        let expected = String(decoding: (source.before + text).utf16.suffix(1_200), as: UTF16.self)
+        return current.before == expected
+    }
 }
 
 /// What the focused field reports about how its text looks at the caret. Every
@@ -35,6 +59,8 @@ struct InlineMetrics {
 protocol TextObserver: AnyObject {
     func textDidChange(_ snapshot: TextSnapshot?)
     func invalidateSuggestion()
+    func textWillChange()
+    func insertionConfirmed(text: String, replacingSelection: Bool)
     func hasAcceptableSuggestion() -> Bool
     func acceptSuggestion(full: Bool) -> Bool
     func dismissSuggestion() -> Bool
@@ -51,23 +77,42 @@ final class AccessibilityMonitor {
     private var observer: AXObserver?
     private var observedElement: AXUIElement?
     private var observedApp: AXUIElement?
+    private var observedWindow: AXUIElement?
     private var currentPID: pid_t = 0
     private var refreshTask: Task<Void, Never>?
     private var activatedToken: NSObjectProtocol?
+    private var pointerToken: Any?
+    private var lifecycle: UInt64 = 0
     private var focusedSnapshot: TextSnapshot?
+    private var pendingInsertion: InsertionReceipt?
 
     var isTrusted: Bool { AXIsProcessTrusted() }
 
     @discardableResult
     func start() -> Bool {
         guard isTrusted else { return false }
+        guard activatedToken == nil else { return tap != nil }
+        lifecycle &+= 1
+        let startedLifecycle = lifecycle
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
         activatedToken = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.watchFrontmostApp() }
+            Task { @MainActor in
+                guard let self, self.lifecycle == startedLifecycle, self.activatedToken != nil else { return }
+                self.watchFrontmostApp()
+            }
+        }
+        pointerToken = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .scrollWheel]) { [weak self] event in
+            let delay: Duration = event.type == .scrollWheel ? .milliseconds(180) : .milliseconds(25)
+            Task { @MainActor in
+                guard let self, self.lifecycle == startedLifecycle, self.activatedToken != nil else { return }
+                self.pendingInsertion = nil
+                self.delegate?.invalidateSuggestion()
+                self.scheduleRefresh(force: true, delay: delay)
+            }
         }
         watchFrontmostApp()
         installTap()
@@ -76,7 +121,11 @@ final class AccessibilityMonitor {
     }
 
     func stop() {
+        lifecycle &+= 1
+        if let pointerToken { NSEvent.removeMonitor(pointerToken) }
+        pointerToken = nil
         refreshTask?.cancel()
+        pendingInsertion = nil
         if let token = activatedToken { NSWorkspace.shared.notificationCenter.removeObserver(token) }
         activatedToken = nil
         if let tap {
@@ -89,12 +138,13 @@ final class AccessibilityMonitor {
         delegate?.textDidChange(nil)
     }
 
-    func scheduleRefresh(force: Bool = false) {
+    func scheduleRefresh(force: Bool = false, delay: Duration = .milliseconds(25)) {
+        guard activatedToken != nil else { return }
         refreshTask?.cancel()
         refreshTask = Task { @MainActor [weak self] in
             // Read as soon as the app has applied the key; Chromium and Electron can publish
             // the edit a beat later, so a second read catches it (unchanged text is ignored).
-            try? await Task.sleep(for: .milliseconds(25))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
             self?.refresh(force: force)
             try? await Task.sleep(for: .milliseconds(120))
@@ -104,6 +154,11 @@ final class AccessibilityMonitor {
     }
 
     private func watchFrontmostApp() {
+        guard activatedToken != nil else { return }
+        refreshTask?.cancel()
+        pendingInsertion = nil
+        focusedSnapshot = nil
+        delegate?.invalidateSuggestion()
         removeObserver()
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier,
@@ -122,10 +177,17 @@ final class AccessibilityMonitor {
         let enabledElectronTree = AXUIElementSetAttributeValue(
             application, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success
         var created: AXObserver?
-        if AXObserverCreate(currentPID, { _, _, _, userData in
+        if AXObserverCreate(currentPID, { _, _, notification, userData in
             guard let userData else { return }
             let monitor = Unmanaged<AccessibilityMonitor>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { monitor.refreshAfterNotification() }
+            let geometryChanged = notification as String == kAXMovedNotification
+                || notification as String == kAXResizedNotification
+            let callbackLifecycle = monitor.lifecycle
+            DispatchQueue.main.async {
+                guard monitor.lifecycle == callbackLifecycle, monitor.activatedToken != nil else { return }
+                if geometryChanged { monitor.delegate?.invalidateSuggestion() }
+                monitor.refreshAfterNotification()
+            }
         }, &created) == .success, let created {
             observer = created
             let source = AXObserverGetRunLoopSource(created)
@@ -138,9 +200,11 @@ final class AccessibilityMonitor {
         refresh()
         if enabledElectronTree {
             let pid = currentPID
+            let callbackLifecycle = lifecycle
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(400))
-                guard let self, self.currentPID == pid else { return }
+                guard let self, self.currentPID == pid, self.lifecycle == callbackLifecycle,
+                      self.activatedToken != nil, !Task.isCancelled else { return }
                 self.refresh()
             }
         }
@@ -157,21 +221,44 @@ final class AccessibilityMonitor {
                 AXObserverRemoveNotification(observer, observedElement, kAXSelectedTextChangedNotification as CFString)
                 AXObserverRemoveNotification(observer, observedElement, kAXUIElementDestroyedNotification as CFString)
             }
+            if let observedWindow {
+                AXObserverRemoveNotification(observer, observedWindow, kAXMovedNotification as CFString)
+                AXObserverRemoveNotification(observer, observedWindow, kAXResizedNotification as CFString)
+            }
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         }
         observer = nil
         observedElement = nil
         observedApp = nil
+        observedWindow = nil
         currentPID = 0
     }
 
     private func refresh(force: Bool = false) {
+        guard activatedToken != nil else { return }
         guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier == currentPID,
               app.bundleIdentifier != Bundle.main.bundleIdentifier,
               let appID = app.bundleIdentifier, let application = observedApp else {
             focusedSnapshot = nil
             delegate?.textDidChange(nil)
             return
+        }
+        var windowRef: CFTypeRef?
+        if let observer,
+           AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute as CFString, &windowRef) == .success,
+           let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID() {
+            let window = windowRef as! AXUIElement
+            if observedWindow == nil || !CFEqual(observedWindow, window) {
+                if let observedWindow {
+                    AXObserverRemoveNotification(observer, observedWindow, kAXMovedNotification as CFString)
+                    AXObserverRemoveNotification(observer, observedWindow, kAXResizedNotification as CFString)
+                }
+                observedWindow = window
+                for name in [kAXMovedNotification, kAXResizedNotification] {
+                    AXObserverAddNotification(observer, window, name as CFString,
+                                              Unmanaged.passUnretained(self).toOpaque())
+                }
+            }
         }
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
@@ -184,6 +271,8 @@ final class AccessibilityMonitor {
         let element = focused as! AXUIElement
         AXUIElementSetMessagingTimeout(element, 0.25)
         if observedElement == nil || !CFEqual(observedElement, element) {
+            pendingInsertion = nil
+            delegate?.invalidateSuggestion()
             if let observer, let observedElement {
                 AXObserverRemoveNotification(observer, observedElement, kAXValueChangedNotification as CFString)
                 AXObserverRemoveNotification(observer, observedElement, kAXSelectedTextChangedNotification as CFString)
@@ -199,9 +288,24 @@ final class AccessibilityMonitor {
             }
         }
         let snapshot = read(element: element, pid: currentPID, appID: appID, appName: app.localizedName ?? appID)
-        if force || snapshot?.fingerprint != focusedSnapshot?.fingerprint {
+        confirmInsertion(snapshot)
+        let unchanged = snapshot.flatMap { next in
+            focusedSnapshot.map { next.matchesContent($0) && next.caret == $0.caret }
+        } ?? (snapshot == nil && focusedSnapshot == nil)
+        if force || !unchanged {
             focusedSnapshot = snapshot
             delegate?.textDidChange(snapshot)
+        }
+    }
+
+    private func confirmInsertion(_ snapshot: TextSnapshot?) {
+        guard let receipt = pendingInsertion else { return }
+        if let snapshot, receipt.matches(snapshot) {
+            pendingInsertion = nil
+            delegate?.insertionConfirmed(text: receipt.text, replacingSelection: receipt.source.range.length > 0)
+        } else if Date() > receipt.expiresAt || snapshot == nil
+                    || snapshot.map({ !receipt.source.matchesContent($0) }) == true {
+            pendingInsertion = nil
         }
     }
 
@@ -460,19 +564,25 @@ final class AccessibilityMonitor {
                 }
             }
         }
-        var fieldFrame: CGRect?
-        var positionRef: CFTypeRef?
-        var sizeRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionRef) == .success,
-           AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
-           let positionRef, let sizeRef,
-           CFGetTypeID(positionRef) == AXValueGetTypeID(), CFGetTypeID(sizeRef) == AXValueGetTypeID() {
+        func frame(of target: AXUIElement) -> CGRect? {
+            var positionRef: CFTypeRef?
+            var sizeRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(target, kAXPositionAttribute as CFString, &positionRef) == .success,
+                  AXUIElementCopyAttributeValue(target, kAXSizeAttribute as CFString, &sizeRef) == .success,
+                  let positionRef, let sizeRef,
+                  CFGetTypeID(positionRef) == AXValueGetTypeID(),
+                  CFGetTypeID(sizeRef) == AXValueGetTypeID() else { return nil }
             var origin = CGPoint.zero
             var size = CGSize.zero
-            if AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
-               AXValueGetValue(sizeRef as! AXValue, .cgSize, &size), size.width > 0, size.height > 0 {
-                fieldFrame = CGRect(origin: origin, size: size)
-            }
+            guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
+                  AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) else { return nil }
+            let result = CGRect(origin: origin, size: size)
+            return result.isFinite && size.width > 0 && size.height > 0 ? result : nil
+        }
+        var fieldFrame = frame(of: element)
+        if let window = elementAttribute(kAXWindowAttribute, on: element) ?? observedWindow,
+           let windowFrame = frame(of: window) {
+            fieldFrame = fieldFrame.map { $0.intersection(windowFrame) } ?? windowFrame
         }
         // The visual line can start mid-paragraph when the field soft-wraps.
         var lineStartX: CGFloat?
@@ -516,6 +626,7 @@ final class AccessibilityMonitor {
     static let syntheticEventTag: Int64 = 0x4643_4D50
 
     func insert(_ text: String, matching snapshot: TextSnapshot) -> Bool {
+        guard activatedToken != nil, !text.isEmpty else { return false }
         let application = AXUIElementCreateApplication(snapshot.pid)
         AXUIElementSetMessagingTimeout(application, 0.25)
         var focused: CFTypeRef?
@@ -527,25 +638,32 @@ final class AccessibilityMonitor {
         // A rich editor's focus can be a child of the editor root the snapshot was read from.
         guard CFEqual(element, snapshot.element) || editableRoot(of: element).map({ CFEqual($0, snapshot.element) }) == true,
               let current = read(element: element, pid: snapshot.pid, appID: snapshot.appID, appName: snapshot.appName),
-              current.fingerprint == snapshot.fingerprint else {
+              current.matchesContent(snapshot) else {
             Trace.log("insert refused: field changed since the suggestion")
             return false
         }
+        confirmInsertion(current)
+        pendingInsertion = InsertionReceipt(source: snapshot, text: text, expiresAt: Date().addingTimeInterval(2))
         // Web and Electron editors often report success for an Accessibility insert
         // without changing their content, so type there. Native fields take AX directly.
         if !snapshot.isWebContent,
            AXUIElementSetAttributeValue(snapshot.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
             Trace.log("inserted via Accessibility \(text.debugDescription)")
         } else {
-            type(text, to: snapshot.pid)
+            guard type(text, to: snapshot.pid) else {
+                pendingInsertion = nil
+                return false
+            }
             Trace.log("inserted by typing \(text.debugDescription)")
         }
+        confirmInsertion(read(element: element, pid: snapshot.pid, appID: snapshot.appID, appName: snapshot.appName))
         scheduleRefresh(force: true)
         return true
     }
 
-    private func type(_ text: String, to pid: pid_t) {
-        let source = CGEventSource(stateID: .combinedSessionState)
+    private func type(_ text: String, to pid: pid_t) -> Bool {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return false }
+        var events: [CGEvent] = []
         let units = Array(text.utf16)
         var index = 0
         while index < units.count {
@@ -554,14 +672,18 @@ final class AccessibilityMonitor {
             if end < units.count, UTF16.isLeadSurrogate(units[end - 1]) { end -= 1 }
             var chunk = Array(units[index..<end])
             for down in [true, false] {
-                guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
+                guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { return false }
                 event.flags = []
                 event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
                 event.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventTag)
-                event.postToPid(pid)
+                events.append(event)
             }
             index = end
         }
+        // Allocate the entire sequence before posting; allocation failure cannot
+        // leave half an insertion in the user's document.
+        for event in events { event.postToPid(pid) }
+        return true
     }
 
     private func installTap() {
@@ -643,8 +765,13 @@ final class AccessibilityMonitor {
                 return true
             }
         }
-        // Any event that reaches the application invalidates in-flight and visible completions.
-        delegate?.invalidateSuggestion()
+        // Only ordinary typing may retain a matching continuation. Navigation,
+        // shortcuts and focus changes must discard it even if text stays equal.
+        if length == 1, character >= 32, character != 127, modifiers.isEmpty {
+            delegate?.textWillChange()
+        } else {
+            delegate?.invalidateSuggestion()
+        }
         scheduleRefresh()
         return false
     }

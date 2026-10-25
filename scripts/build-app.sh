@@ -2,6 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION="${FREECOMPLETE_VERSION:-0.1.0}"
+BUILD_NUMBER="${FREECOMPLETE_BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD)}"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'Version must be major.minor.patch and build number a positive integer.' >&2; exit 1;
+}
 COMMIT=f2cc7282ce0042641df55e0e563b75e824e2b647
 MODEL_REV=a9bf638e53783fc93778f357cc5c672eab5393b1
 MODEL_SHA=3cc0e9c2b4bbffea7f3f6cfe1ffd1591f4dafe02c43f78952f1142a24172df65
@@ -134,6 +139,7 @@ cp "$EXECUTABLE" "$APP/Contents/MacOS/FreeComplete"
 cp "$MODEL" "$APP/Contents/Resources/model.gguf"
 cp "$MODEL_LICENSE" "$APP/Contents/Resources/Licenses/Gemma-4-E2B-Apache-2.0.txt"
 cp "$ROOT/Licenses/THIRD_PARTY_NOTICES.txt" "$APP/Contents/Resources/Licenses/THIRD_PARTY_NOTICES.txt"
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/Licenses/FreeComplete-Apache-2.0.txt"
 
 # Include original upstream notices for the statically linked dependencies, not only the top-level MIT license.
 while IFS= read -r -d '' file; do
@@ -151,14 +157,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key><string>FreeComplete</string>
     <key>CFBundleExecutable</key><string>FreeComplete</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
-    <key>LSUIElement</key><true/>
+    <key>LSUIElement</key><false/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>FreeComplete contributors</string>
 </dict></plist>
 PLIST
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 
 # Seal the app and its immutable model/resources.
@@ -183,7 +191,7 @@ echo "Packaged $OUTPUT"
 # Keep an installed copy current. APFS clones share blocks with dist/, so the
 # 3.4 GB bundle costs no extra space. First install: see README.
 INSTALLED=/Applications/FreeComplete.app
-if [[ -d "$INSTALLED" ]]; then
+if [[ "${FREECOMPLETE_INSTALL:-1}" == 1 && -d "$INSTALLED" ]]; then
     rm -rf "$INSTALLED.new"
     cp -cR "$OUTPUT" "$INSTALLED.new"
     rm -rf "$INSTALLED"
