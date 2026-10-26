@@ -202,7 +202,8 @@ final class AccessibilityMonitor {
             let pid = currentPID
             let callbackLifecycle = lifecycle
             Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(400))
+                // Electron 43 defers complete accessibility mode by two seconds.
+                try? await Task.sleep(for: .milliseconds(2_200))
                 guard let self, self.currentPID == pid, self.lifecycle == callbackLifecycle,
                       self.activatedToken != nil, !Task.isCancelled else { return }
                 self.refresh()
@@ -376,8 +377,11 @@ final class AccessibilityMonitor {
 
     private func markerParameter(_ name: String, _ parameter: CFTypeRef, on element: AXUIElement) -> CFTypeRef? {
         var value: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(element, name as CFString, parameter, &value) == .success
-        else { return nil }
+        let status = AXUIElementCopyParameterizedAttributeValue(element, name as CFString, parameter, &value)
+        guard status == .success else {
+            Trace.log("marker \(name): AXError \(status.rawValue)")
+            return nil
+        }
         return value
     }
 
@@ -396,8 +400,9 @@ final class AccessibilityMonitor {
         guard let value = markerParameter("AXBoundsForTextMarkerRange", range, on: element),
               CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
         var rect = CGRect.zero
-        guard AXValueGetValue(value as! AXValue, .cgRect, &rect), rect.isFinite,
-              rect.height > 2, rect.height < 100 else { return nil }
+        guard AXValueGetValue(value as! AXValue, .cgRect, &rect) else { return nil }
+        Trace.log("marker bounds: \(rect)")
+        guard rect.isFinite, rect.height > 2, rect.height < 100 else { return nil }
         return rect
     }
 
@@ -516,12 +521,17 @@ final class AccessibilityMonitor {
             var range = CFRange(location: location, length: length)
             guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
             var value: CFTypeRef?
-            guard AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString,
-                                                             parameter, &value) == .success,
-                  let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+            let status = AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString,
+                                                                    parameter, &value)
+            guard status == .success,
+                  let value, CFGetTypeID(value) == AXValueGetTypeID() else {
+                Trace.log("range bounds \(location),\(length): AXError \(status.rawValue)")
+                return nil
+            }
             var rect = CGRect.zero
-            guard AXValueGetValue(value as! AXValue, .cgRect, &rect), rect.isFinite,
-                  rect.height > 2, rect.height < 100 else { return nil }
+            guard AXValueGetValue(value as! AXValue, .cgRect, &rect) else { return nil }
+            Trace.log("range bounds \(location),\(length): \(rect)")
+            guard rect.isFinite, rect.height > 2, rect.height < 100 else { return nil }
             return rect
         }
         if let previous, !previous.isNewline, location > 0,

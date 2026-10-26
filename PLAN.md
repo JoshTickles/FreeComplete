@@ -21,6 +21,17 @@ The release remains pre-release. Power controls and aggregate savings are implem
 - Second Sonnet code review reports no blockers and confirms the first-round fixes, with one remaining setting-change/preload-state defect. A real-model regression reproduces the cancelled preloader leaving the runtime at “Loading model”; runtime readiness now publishes after successful session loading even if that waiter is cancelled. Settings refresh clears stale suggestion/demo/context state without cancelling preload or clearing the Escape pause. Fable code reviews both time out without a verdict; the earlier two-model plan reviews are not code approval. Low-priority observations about user-triggered load-backoff resets and possible fractional caret jitter remain unverified or unchanged.
 - **Still blocked:** desktop-control approval timed out twice. Current-build UI, ordinary cross-app typing, actual sleep/wake, live permission recovery, secure-field behavior, and visual/contrast checks remain unverified. The running installed app was not restarted during this pass. `security find-identity -v -p codesigning` reports zero valid identities, so Developer ID signing/notarization and clean-Mac distribution remain external release gates.
 
+### 2026-10-27 cross-app failure investigation
+
+Josh reports no autocomplete in Ferdium, Zen and VS Code after local installation. Treat this as an unresolved product failure, not a successful release.
+
+- VS Code explicitly had `editor.accessibilitySupport: "off"`. Its focused `native-edit-context` exposed empty text/count and an inaccessible-editor description. Josh approved switching that user preference to `"on"`; the change is applied. Real VS Code suggestion/acceptance verification remains required.
+- Installed Ferdium Electron 43.3.0 and VS Code Electron 43.7.7 both defer full accessibility activation by two seconds. The old 400 ms reacquisition ran too early. Build 16 reacquires after 2.2 seconds and retains lifecycle/PID guards. Exact upstream source: `electron_application.mm` in the corresponding Electron tags.
+- Ferdium's logged failure occurs at caret acquisition, before model generation. A read-only native probe finds ordinary range bounds are zero, while a nonempty unsent composer exposes a valid collapsed marker caret `(1095,1065,0,18)` and previous-glyph rectangle `(1088,1065,7,18)`. An empty composer exposes its whole field, which is not a valid caret. No guessed geometry or weakened field checks are added. Opt-in traces now include AX error codes and raw bounds to distinguish these cases.
+- Build 16 is installed with build 15 preserved. The installed Home model test produces a suggestion. A live TextEdit scratch field reaches generation and `shown " Paris."` in 77–113 ms in observed runs. This does not prove on-screen visibility or physical Tab interception: background-targeted Tab inserts a literal tab, while the session-level attempt sees a different front app. No successful Tab insertion is claimed.
+- Zen's inspected log contains address-bar typing, transient selected-range failures, and noneditable focus. It does not establish a textarea/contenteditable cause. A stable controlled field remains necessary.
+- Focused release regressions and prediction checks pass. Foreground-control approval times out; actual display/acceptance in all three reported apps remains blocked on a stable interactive test. Test drafts are not sent.
+
 ### Acceptance checklist
 
 
